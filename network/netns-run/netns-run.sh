@@ -417,6 +417,31 @@ as_root ip netns exec "$NETNS_NAME" ip link set lo up
 # 4. маршрут по умолчанию внутри netns — через хостовую сторону veth
 as_root ip netns exec "$NETNS_NAME" ip route add default via "$HOST_VETH_IP" dev "$VETH_NS"
 
+# 4'. ping_group_range: per-netns sysctl, включающий непривилегированные
+#     ICMP-сокеты (SOCK_DGRAM, IPPROTO_ICMP) — их используют ping и
+#     traceroute -I. Host-systemd задаёт это значение только в initial
+#     netns (/usr/lib/sysctl.d/50-default.conf); в новый netns оно
+#     автоматически не попадает, поэтому копируем текущее значение хоста:
+#     читаем его из /proc/sys хоста (tab -> space) в переменную, затем
+#     записываем только внутрь собственного netns (хост не затрагивается),
+#     значение умирает вместе с netns — cleanup не нужен.
+#     Сбой не фатален: назначение скрипта — запуск команды, ping — лишь
+#     диагностика.
+PING_GROUP_RANGE=""
+if [[ -r /proc/sys/net/ipv4/ping_group_range ]]; then
+  PING_GROUP_RANGE=$(tr '\t' ' ' < /proc/sys/net/ipv4/ping_group_range)
+else
+  log "ПРЕДУПРЕЖДЕНИЕ: не удалось прочитать host-значение net.ipv4.ping_group_range — ping и traceroute -I внутри netns могут не работать"
+fi
+if [[ -n "$PING_GROUP_RANGE" ]]; then
+  if ! as_root ip netns exec "$NETNS_NAME" \
+       sysctl -qw "net.ipv4.ping_group_range=$PING_GROUP_RANGE"; then
+    log "ПРЕДУПРЕЖДЕНИЕ: не удалось задать net.ipv4.ping_group_range в netns — ping и traceroute -I у непривилегированного пользователя могут не работать"
+  else
+    log "ping_group_range в netns: $PING_GROUP_RANGE (копия значения хоста)"
+  fi
+fi
+
 # 5. DNS: по умолчанию ничего не делаем — без /etc/netns/<name>/resolv.conf
 #    `ip netns exec` не подменяет /etc/resolv.conf, и процессы внутри
 #    netns видят текущий resolv.conf хоста как есть. Если DNS задан

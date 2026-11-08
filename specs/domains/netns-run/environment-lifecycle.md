@@ -50,6 +50,7 @@ Cleanup-трап установлен на EXIT/INT/TERM с момента сб�
 | 2 | `ip link add VETH_HOST type veth peer name VETH_NS`; `ip link set VETH_NS netns` | `CREATED_VETH` |
 | 3 | адреса `HOST_VETH_IP`/`NS_VETH_IP`, `link up`, `lo up` (внутри netns) | (покрывается veth/netns) |
 | 4 | `ip netns exec ... ip route add default via HOST_VETH_IP dev VETH_NS` | (внутри netns) |
+| 4' | копия `net.ipv4.ping_group_range`: чтение `/proc/sys/net/ipv4/ping_group_range` хоста (tab→space) в `PING_GROUP_RANGE` под `[[ -r ]]`; запись внутрь netns — `ip netns exec ... sysctl -qw net.ipv4.ping_group_range=...` | — |
 | 5 | DNS: без `-d` ничего (хостовый resolv.conf виден как есть); с `-d` — `/etc/netns/<name>/resolv.conf` с `nameserver`-ами | `CREATED_RESOLV_DIR` |
 | 6 | чтение `/proc/sys/net/ipv4/ip_forward`; если не 1 — `sysctl -qw ...=1` | `CHANGED_FORWARD` + `IP_FORWARD_ORIG` |
 | 7 | `iptables -t nat -A POSTROUTING -s NS_SUBNET -o HOST_IFACE -j MASQUERADE`; два правила FORWARD (outgoing ACCEPT; incoming ESTABLISHED,RELATED) | `ADDED_NAT_RULE`, `ADDED_FWD_RULE1/2` |
@@ -84,6 +85,7 @@ as_root ip netns exec "$NETNS_NAME" sudo -E -u "$RUN_AS_USER" -- "$@"
 - Сбои внутри сборки под `set -e` прерывают скрипт; трап EXIT запускает cleanup созданных объектов.
 - Недостижимый шлюз / отсутствие default-маршрута на интерфейсе / неопределённая on-link подсеть — `die` или предупреждение (см. шаг автоопределения).
 - Неудачный резолв домена в `--route`/`--exclude` — `die` (после поднятия DNS внутри netns).
+- Шаг 4' — best-effort: нечитаемый `/proc/sys/net/ipv4/ping_group_range` на хосте или неудачная запись значения в netns не прерывают скрипт — `[netns-run] ПРЕДУПРЕЖДЕНИЕ`, сборка продолжается (ping и `traceroute -I` у непривилегированного пользователя внутри netns могут не работать).
 - Ошибки при очистке подавляются: очистка идемпотентна и не должна маскировать код выхода команды.
 - Возврат кода: скрипт завершается кодом запущенной команды (`APP_EC`), а не кодом очистки.
 

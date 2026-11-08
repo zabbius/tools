@@ -16,6 +16,7 @@
 | `iptables -t nat -A/D POSTROUTING -s <NS_SUBNET> -o <IFACE> -j MASQUERADE` | `iptables` | сборка/очистка | NAT трафика netns наружу |
 | `iptables -A/D FORWARD -i/-o <VETH_HOST> ...` | `iptables` | сборка/очистка | разрешить форвардинг netns↔IFACE (out ACCEPT; in ESTABLISHED,RELATED) |
 | `sysctl -qw net.ipv4.ip_forward` | `sysctl` / `/proc/sys` | сборка/очистка | включить форвардинг, восстановить исходное значение |
+| `ip netns exec <ns> sysctl -qw net.ipv4.ping_group_range=<значение хоста>` | `sysctl` / `/proc/sys` | сборка (шаг 4') | копия host-значения только внутрь netns: ICMP/UDP-сокеты у непривилегированного пользователя (`ping`, `traceroute -I`) — как на хосте; хост не затрагивается, значение умирает вместе с netns |
 | `ip netns exec <ns> nslookup <domain>` | `nslookup` | шаги 9–10 | резолв доменов внутри netns (A-записи) |
 | `sudo` (`as_root`, `sudo -v`, keepalive `sudo -n true`, `ip netns exec ... sudo -E -u <user>`) | `sudo` | все привилегированные шаги | права root + запуск команды от имени пользователя |
 | `mkdir/tee/rm -rf /etc/netns/<name>/resolv.conf` | coreutils | шаг 5 / очистка | per-netns DNS при явном `-d` |
@@ -29,7 +30,7 @@
 ## Data Flow Across Boundary
 
 Внутрь (скрипт → хост): последовательности `ip`/`iptables`/`sysctl` команд с параметрами, выведенными из аргументов CLI и сгенерированных из PID; текстовые файлы (`/etc/netns/<name>/resolv.conf` при `-d`).
-Наружу (хост → скрипт): stdout однострочных запросов `ip` (`route get`, `route show`) и `nslookup`, парсится awk'ом; коды выхода команд; `/proc/sys/net/ipv4/ip_forward` (чтение cat'ом).
+Наружу (хост → скрипт): stdout однострочных запросов `ip` (`route get`, `route show`) и `nslookup`, парсится awk'ом; коды выхода команд; `/proc/sys/net/ipv4/ip_forward` (чтение cat'ом); `/proc/sys/net/ipv4/ping_group_range` (чтение host-значения с нормализацией tab→space, шаг 4').
 К запускаемой команде: готовое netns-окружение с default-маршрутом на хостовую сторону veth, DNS (хостовый resolv.conf как есть либо заданный `-d`) и policy routing через заданный шлюз.
 
 ## Error Propagation

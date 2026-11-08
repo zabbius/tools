@@ -25,6 +25,9 @@ RULE_PRIO=$((20000 + PID_SUFFIX % 1000))      # pref основного ip rule
 EXCLUDE_RULE_PRIO=$((RULE_PRIO - 10))         # pref правил-исключений (выше приоритетом)
 HOST_VETH_IP="10.200.<OCTET>.1"; NS_VETH_IP="10.200.<OCTET>.2"; NS_SUBNET="10.200.<OCTET>.0/30"
 
+PING_GROUP_RANGE=""  # host-значение net.ipv4.ping_group_range для шага 4'
+                     # (копируется только в netns; умирает вместе с netns — флаг очистки не нужен)
+
 # флаги созданных объектов для очистки (CREATED_NETNS, CREATED_VETH,
 # ADDED_NAT_RULE, ADDED_FWD_RULE1/2, ADDED_RULE, ADDED_EXCLUDE_RULE,
 # ADDED_ROUTE, ADDED_LOCAL_ROUTE, CHANGED_FORWARD, CREATED_RESOLV_DIR)
@@ -48,6 +51,9 @@ sudo -v + keepalive-процесс (поддержание sudo-прав на в
 1. ip netns add          2. veth-пара (host <-> netns)
 3. адреса 10.200.X.1/2, link up, lo up
 4. default-маршрут в netns -> хостовая сторона veth
+4'. копия host-значения net.ipv4.ping_group_range в netns
+    (ping/traceroute -I у непривилегированного пользователя — как на хосте;
+    сбой не фатален, хост не затрагивается)
 5. DNS: resolv.conf хоста как есть (или /etc/netns/<name>/resolv.conf при -d)
 6. sysctl ip_forward=1 (+запомнить исходное)
 7. iptables: NAT MASQUERADE из NS_SUBNET в HOST_IFACE + 2 правила FORWARD
@@ -69,6 +75,7 @@ cleanup(): ip rule del (осн. + исключения), flush table, iptables -
 
 - Хостовая маршрутизация не изменяется: все изменения (`ip rule`, `TABLE_ID`, iptables) действуют только на трафик с source из `NS_SUBNET` либо добавлены как правила форвардинга для него.
 - Указанный интерфейс хоста никогда не перемещается в netns; связь хост↔netns обеспечивает veth-пара.
+- Внутри netns действует host-значение `net.ipv4.ping_group_range` (копия, шаг 4'): набор ICMP/UDP-сокетных возможностей у непривилегированного пользователя (`ping`, `traceroute -I`) соответствует хосту. Host-значение никогда не изменяется; сбой копирования — non-fatal предупреждение, значение умирает вместе с netns.
 - Валидация всех `--route`/`--route-file`/`--exclude`/`--exclude-file` выполняется до вызова sudo и создания окружения; некорректная строка завершает скрипт с диагностикой и кодом 1.
 - Домены в `--route`/`--exclude` резолвятся внутри netns (после поднятия DNS и default-маршрута), учитывая DNS из `-d`; берутся все A-записи, IPv6 игнорируется.
 - Для адресов/подсетей в `--route` используется `ip route replace` (устойчивость к перекрытию default и повторным запускам), для доменов — `ip route add <ip>/32`.
