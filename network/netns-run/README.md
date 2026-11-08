@@ -1,47 +1,50 @@
 # netns-run.sh
 
-Обёртка для запуска произвольной команды в изолированном network namespace
-(netns) с принудительным направлением всего её сетевого трафика через заданный
-шлюз (gateway), доступный с одного из интерфейсов хоста. Типичное применение —
-запуск приложения через другой канал (второй провайдер, VPN-шлюз, отдельная
-сетевая карта), не меняя маршрутизацию самого хоста.
+A wrapper for running an arbitrary command in an isolated network namespace
+(netns), forcing all of its network traffic through a given gateway,
+reachable via one of the host's interfaces. Typical use case —
+running an application through a different channel (a second provider, a VPN
+gateway, a separate network card) without changing the host's own routing.
 
-После завершения команды (успешного или нет) всё созданное окружение
-автоматически удаляется — включая netns, veth-пару, маршруты, правила
-policy routing, iptables-правила и изменённые sysctl.
+When the command finishes (successfully or not), the entire created environment
+is automatically removed — including the netns, the veth pair, routes, policy
+routing rules, iptables rules and modified sysctls.
 
-## Как это работает
+## How It Works
 
-1. Создаётся временный network namespace (имя по умолчанию `netns-<PID>`).
-2. Между хостом и netns поднимается veth-пара (`10.200.X.1` ↔ `10.200.X.2/30`,
-   X выбирается из PID). **Указанный интерфейс хоста в netns не перемещается** —
-   он остаётся на хосте, связь идёт через veth.
-3. Внутри netns прописывается default-маршрут на хостовую сторону veth.
-4. В netns копируется текущее значение host-sysctl `net.ipv4.ping_group_range` —
-   оно разрешает непривилегированные ICMP-сокеты (SOCK_DGRAM), на которых
-   работают `ping` и `traceroute -I`. Host-systemd задаёт это значение только
-   в initial netns, в новый netns само оно не попадает. Запись идёт только
-   внутрь netns и умирает вместе с ним; сбой не фатален (предупреждение).
-5. На хосте включается форвардинг (если был выключен — исходное значение
-   восстанавливается при очистке), добавляются NAT (MASQUERADE из подсети netns
-   в наружный интерфейс) и правила FORWARD.
-6. Policy routing: добавляется отдельная таблица маршрутов (номер из PID) с
-   маршрутом default через указанный шлюз, и правило
-   `ip rule add pref <P> from <подсеть netns> table <T>` — весь трафик из netns
-   идёт через заданный шлюз, независимо от default-маршрута хоста. Локальная
-   (on-link) подсеть интерфейса добавляется в таблицу отдельным, более
-   специфичным маршрутом — соседи по локальной сети доступны напрямую, а не
-   через шлюз.
-7. Запускается команда: `ip netns exec <netns> sudo -E -u <user> -- <команда>`.
+1. A temporary network namespace is created (default name `netns-<PID>`).
+2. A veth pair is brought up between the host and the netns
+   (`10.200.X.1` ↔ `10.200.X.2/30`, X is chosen from the PID).
+   **The specified host interface is not moved into the netns** — it stays on
+   the host; connectivity goes through the veth.
+3. Inside the netns a default route is set to the host side of the veth.
+4. The current value of the host sysctl `net.ipv4.ping_group_range` is copied
+   into the netns — it permits unprivileged ICMP sockets (SOCK_DGRAM), which
+   `ping` and `traceroute -I` rely on. Host systemd sets this value only in
+   the initial netns; it does not get into a new netns on its own. The write
+   goes only into the netns and dies together with it; a failure is not fatal
+   (a warning).
+5. On the host, forwarding is enabled (if it was disabled, the original value
+   is restored during cleanup), and NAT is added (MASQUERADE from the netns
+   subnet to the outgoing interface) along with FORWARD rules.
+6. Policy routing: a separate routing table (number derived from the PID) is
+   added with a default route via the specified gateway, plus the rule
+   `ip rule add pref <P> from <netns subnet> table <T>` — all traffic from the
+   netns goes through the given gateway, regardless of the host's default
+   route. The interface's local (on-link) subnet is added to the table as a
+   separate, more specific route — LAN neighbors are reachable directly, not
+   through the gateway.
+7. The command is launched: `ip netns exec <netns> sudo -E -u <user> -- <command>`.
 
-## Требования
+## Requirements
 
-- Linux, `root`-права через `sudo` (скрипт сам вызывает sudo; пароль
-  запрашивается один раз, далее поддерживается фоновым keepalive-процессом).
-- Утилиты: `ip` (iproute2), `iptables`, `nslookup` (нужен только если
-  используются домены в `--route`/`--exclude`).
+- Linux, `root` privileges via `sudo` (the script invokes sudo itself; the
+  password is asked once, afterwards it is maintained by a background
+  keepalive process).
+- Utilities: `ip` (iproute2), `iptables`, `nslookup` (needed only if domains
+  are used in `--route`/`--exclude`).
 
-## Использование
+## Usage
 
 ```
 netns-run.sh [-g GATEWAY] [-i IFACE] [-n NETNS] [-d DNS1,DNS2] [-u USER] \
@@ -49,148 +52,152 @@ netns-run.sh [-g GATEWAY] [-i IFACE] [-n NETNS] [-d DNS1,DNS2] [-u USER] \
              [--exclude-file F]... -- COMMAND [ARGS...]
 ```
 
-Нужно задать хотя бы один из `-g` / `-i` — второй определится автоматически:
+At least one of `-g` / `-i` must be given — the other is determined
+automatically:
 
-- задан `-g` → интерфейс ищется через `ip route get GATEWAY`;
-- задан `-i` → шлюз берётся из `ip route show default dev IFACE`.
+- `-g` given → the interface is found via `ip route get GATEWAY`;
+- `-i` given → the gateway is taken from `ip route show default dev IFACE`.
 
-## Опции
+## Options
 
-| Опция | Описание |
+| Option | Description |
 |---|---|
-| `-g GATEWAY` | IPv4-адрес шлюза, через который должен идти весь трафик команды. |
-| `-i IFACE` | Интерфейс хоста, с которого доступен шлюз. |
-| `-n NETNS` | Имя network namespace (по умолчанию `netns-<PID>`). |
-| `-d DNS` | DNS-серверы через запятую для netns (например `1.1.1.1,9.9.9.9`). По умолчанию используется текущий `/etc/resolv.conf` хоста как есть (никаких bind-mount'ов `/etc/netns/...` не создаётся; при явном `-d` создаётся отдельный resolv.conf для этого netns). |
-| `-u USER` | Пользователь, от имени которого запускать команду внутри netns (по умолчанию — запустивший скрипт: `$SUDO_USER` либо текущий). |
-| `-h` | Справка. |
+| `-g GATEWAY` | IPv4 address of the gateway through which all of the command's traffic must go. |
+| `-i IFACE` | Host interface via which the gateway is reachable. |
+| `-n NETNS` | Network namespace name (default `netns-<PID>`). |
+| `-d DNS` | Comma-separated DNS servers for the netns (e.g. `1.1.1.1,9.9.9.9`). By default the host's current `/etc/resolv.conf` is used as is (no `/etc/netns/...` bind mounts are created; with an explicit `-d` a separate resolv.conf is created for this netns). |
+| `-u USER` | User to run the command inside the netns as (default — the user who launched the script: `$SUDO_USER` or the current one). |
+| `-h` | Help. |
 
-## Маршруты и исключения
+## Routes and Exceptions
 
 ### `--route "<addr> via <gw> [dev <iface>]"`
 
-Дополнительный маршрут для указанного адреса/подсети или домена. Синтаксис —
-стандартный для `ip route`; вместо `via` допускается слово `gw`. Оба ключа
-(`--route` и `--route-file`) можно указывать несколько раз и перемешивать.
+An additional route for the given address/subnet or domain. The syntax is the
+standard one for `ip route`; the word `gw` is allowed instead of `via`. Both
+options (`--route` and `--route-file`) may be given multiple times and
+interleaved.
 
-- `<addr>` — IPv4-адрес (`8.8.8.8`), подсеть CIDR (`10.1.0.0/16`, допустимые
-  префиксы `/0`–`/32`) или домен (`example.com`).
-- `<gw>` — IPv4-адрес шлюза (обязателен).
-- `[dev <iface>]` — необязательный хостовый интерфейс, через который доступен
-  `<gw>` (как и основной шлюз `-g`). После `via <gw>` допускается **только**
-  `dev <iface>` — никаких `metric`, `mtu` и т.п.
+- `<addr>` — an IPv4 address (`8.8.8.8`), a CIDR subnet (`10.1.0.0/16`, valid
+  prefixes `/0`–`/32`) or a domain (`example.com`).
+- `<gw>` — an IPv4 gateway address (required).
+- `[dev <iface>]` — an optional host interface via which `<gw>` is reachable
+  (same as the main gateway `-g`). After `via <gw>` **only** `dev <iface>` is
+  allowed — no `metric`, `mtu`, etc.
 
-Маршруты добавляются в ту же policy-таблицу, что и default, поэтому действуют
-**только для трафика из netns** — хост не затрагивается. Для адресов/подсетей
-используется `ip route replace` (устойчиво к перекрытию default и повторным
-запускам), для доменов — `ip route add <ip>/32` на каждый IPv4-адрес домена.
+Routes are added to the same policy table as the default route, so they apply
+**only to traffic from the netns** — the host is not affected. For
+addresses/subnets `ip route replace` is used (robust against an overlapping
+default route and repeated runs), for domains — `ip route add <ip>/32` for
+every IPv4 address of the domain.
 
 ### `--route-file <file>`
 
-Файл, в каждой непустой строке которого — маршрут в формате `--route`
-(строки, начинающиеся с `#`, игнорируются). Эквивалентен нескольким `--route`.
-Можно указывать несколько раз.
+A routes file in which every non-empty line is a route in the `--route` format
+(lines starting with `#` are ignored). Equivalent to several `--route` options.
+May be specified multiple times.
 
 ### `--exclude <addr|domain>`
 
-Адрес/подсеть CIDR или домен, трафик к которым из netns направляется по
-**системной маршрутизации хоста** (основная таблица `main`) — как если бы netns
-не было. Реализуется правилом `ip rule add pref <P-10> from <подсеть netns>
-to <addr> table main`, приоритет которого выше (меньше номер), чем у основного
-правила netns. Можно указывать несколько раз.
+An address/CIDR subnet or a domain whose traffic from the netns is routed by
+the **host's system routing** (the main `main` table) — as if the netns did
+not exist. Implemented by the rule `ip rule add pref <P-10> from <netns subnet>
+to <addr> table main`, whose priority is higher (a lower number) than that of
+the main netns rule. May be specified multiple times.
 
-- для IP/подсети — одно правило (`to 8.8.8.8`, `to 192.168.23.0/24`);
-- для домена — правило `/32` на каждый IPv4-адрес домена.
+- for an IP/subnet — a single rule (`to 8.8.8.8`, `to 192.168.23.0/24`);
+- for a domain — a `/32` rule for every IPv4 address of the domain.
 
 ### `--exclude-file <file>`
 
-Файл, по строке на исключение (формат как у `--exclude`; пустые строки и
-`#`-комментарии игнорируются). Эквивалентен нескольким `--exclude`.
-Можно указывать несколько раз.
+An exclude file with one exception per line (format same as `--exclude`; empty
+lines and `#` comments are ignored). Equivalent to several `--exclude` options.
+May be specified multiple times.
 
-### Валидация и домены
+### Validation and Domains
 
-Все строки `--route`/`--route-file`/`--exclude`/`--exclude-file` валидируются
-**до** sudo и создания окружения — некорректная строка роняет скрипт сразу,
-с внятным сообщением. Формат имени домена проверяется синтаксически;
-сами адреса домена резолвятся позже, **внутри netns** (после поднятия DNS и
-default-маршрута), поэтому учитываются DNS-серверы из `-d` и разрешаются все
-A-записи (IPv6-ответы игнорируются).
+All `--route`/`--route-file`/`--exclude`/`--exclude-file` lines are validated
+**before** sudo and environment creation — an invalid line fails the script
+immediately, with a clear message. The domain name format is checked
+syntactically; the domain's addresses are resolved later, **inside the netns**
+(after DNS and the default route are up), so the DNS servers from `-d` are
+used and all A records are resolved (IPv6 answers are ignored).
 
-## Примеры
+## Examples
 
 ```bash
-# весь трафик firefox через шлюз 192.168.1.5
+# all firefox traffic via gateway 192.168.1.5
 ./netns-run.sh -g 192.168.1.5 -- firefox
 
-# интерфейс задан, шлюз берётся его default-маршрута
+# interface given, gateway taken from its default route
 ./netns-run.sh -i eth1 -- firefox
 
-# подсеть 10.40.0.0/16 — через отдельный шлюз 192.168.1.254
+# subnet 10.40.0.0/16 — via a separate gateway 192.168.1.254
 ./netns-run.sh -g 192.168.1.5 --route "10.40.0.0/16 via 192.168.1.254" -- firefox
 
-# синоним gw; подсеть 10.1.0.0/16 через 192.168.23.100
+# gw synonym; subnet 10.1.0.0/16 via 192.168.23.100
 ./netns-run.sh -g 192.168.1.5 --route "10.1.0.0/16 gw 192.168.23.100" -- curl https://example.com
 
-# домен: маршруты /32 на все его адреса
+# domain: /32 routes to all of its addresses
 ./netns-run.sh -g 192.168.1.5 --route "example.com via 192.168.1.254" -- curl https://example.com
 
-# 192.168.23.0/24 — по системной маршрутизации хоста (мимо netns-шлюза)
+# 192.168.23.0/24 — via the host's system routing (bypassing the netns gateway)
 ./netns-run.sh -g 192.168.1.5 --exclude 192.168.23.0/24 -- curl https://example.com
 
-# маршруты и исключения из файлов
+# routes and exceptions from files
 ./netns-run.sh -g 192.168.1.5 --route-file routes.txt --exclude-file exclude.txt -- firefox
 ```
 
-Пример `routes.txt`:
+Example `routes.txt`:
 
 ```
-# шлюз для корпоративной подсети
+# gateway for the corporate subnet
 10.40.0.0/16 via 192.168.1.254
-# хост базы данных
+# database host
 10.40.1.10 via 192.168.1.254 dev eth1
-# домен — все его A-записи
+# domain — all of its A records
 gitlab.corp.example via 192.168.1.254
 ```
 
-Пример `exclude.txt`:
+Example `exclude.txt`:
 
 ```
-# локальная сеть принтера
+# the printer's local network
 192.168.23.0/24
-# домены в обход туннеля
+# domains bypassing the tunnel
 internal.corp.example
 ```
 
-## Очистка
+## Cleanup
 
-Очистка выполняется по `EXIT`/`INT`/`TERM` и удаляет всё созданное: правила
-`ip rule` (основное и исключения), маршруты таблицы (flush), iptables-правила
-(FORWARD, NAT), netns (вместе с veth-парой), `/etc/netns/<name>/resolv.conf`
-(если создавался), и восстанавливает исходное значение `net.ipv4.ip_forward`,
-если оно было изменено.
+Cleanup runs on `EXIT`/`INT`/`TERM` and removes everything that was created:
+the `ip rule` rules (the main one and the exceptions), the table's routes
+(flush), the iptables rules (FORWARD, NAT), the netns (together with the veth
+pair), `/etc/netns/<name>/resolv.conf` (if it was created), and restores the
+original value of `net.ipv4.ip_forward` if it was changed.
 
-## Ограничения
+## Limitations
 
-- Только IPv4 (шлюз, DNS-серверы, маршруты и исключения — IPv4; AAAA-ответы
-  при резолве доменов игнорируются).
-- IP-адреса доменов в `--route`/`--exclude` фиксируются на момент запуска —
-  если DNS-записи домена изменятся во время работы команды, маршруты/правила
-  не обновятся.
-- Параллельные запуски безопасны: имена veth, номер таблицы и приоритеты
-  `ip rule` генерируются из PID скрипта (возможно совпадение номера таблицы
-  у запусков с совпадающими `PID % 100` — в этом случае таблица будет общей).
-- Скрипт предполагает, что указанный шлюз доступен с указанного (или
-  автоматически определённого) интерфейса хоста.
-- Диагностические сетевые утилиты внутри netns работают с теми же правами,
-  что и на хосте. `ping` и `traceroute -I` работают «как на хосте» — в netns
-  копируется host-sysctl `net.ipv4.ping_group_range` (см. шаг 4 раздела
-  «Как это работает»); `tracepath` и `traceroute` (UDP-режим) привилегий
-  не требуют вовсе; инструментам, которым нужен настоящий `CAP_NET_RAW`,
-  требуется root (`-u root`) — и внутри netns, и на хосте. Матрица:
+- IPv4 only (gateway, DNS servers, routes and exceptions are IPv4; AAAA
+  answers are ignored when resolving domains).
+- The IP addresses of domains in `--route`/`--exclude` are fixed at launch
+  time — if the domain's DNS records change while the command runs, the
+  routes/rules are not updated.
+- Parallel runs are safe: veth names, the table number and the `ip rule`
+  priorities are generated from the script PID (runs with matching
+  `PID % 100` may get the same table number — in that case the table is
+  shared).
+- The script assumes the specified gateway is reachable via the specified (or
+  automatically determined) host interface.
+- Diagnostic network utilities inside the netns run with the same privileges
+  as on the host. `ping` and `traceroute -I` work "as on the host" — the host
+  sysctl `net.ipv4.ping_group_range` is copied into the netns (see step 4 of
+  the "How It Works" section); `tracepath` and `traceroute` (UDP mode) need no
+  privileges at all; tools that require real `CAP_NET_RAW` require root
+  (`-u root`) — both inside the netns and on the host. Matrix:
 
-| Утилита | Внутри netns | На хосте |
+| Utility | Inside the netns | On the host |
 |---|---|---|
-| `ping`, `traceroute -I` | работают у обычного пользователя («как на хосте», через копию `net.ipv4.ping_group_range`) | то же самое (sysctl задаёт host-systemd) |
-| `tracepath`, `traceroute` (UDP) | работают без привилегий | работают без привилегий |
-| `traceroute -T`, `tcpdump` | требуют root: запускайте через `-u root` | тоже требуют root |
+| `ping`, `traceroute -I` | work for a regular user ("as on the host", via a copy of `net.ipv4.ping_group_range`) | the same (the sysctl is set by host systemd) |
+| `tracepath`, `traceroute` (UDP) | work without privileges | work without privileges |
+| `traceroute -T`, `tcpdump` | require root: run via `-u root` | also require root |

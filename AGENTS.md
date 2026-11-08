@@ -17,7 +17,7 @@ A collection of small, independent system utilities ("Misc tools"), written as s
 
 ## Conventions
 
-- Each tool is a standalone script in `<category>/<tool-name>/` with its own `README.md` (user-facing language: Russian).
+- Each tool is a standalone script in `<category>/<tool-name>/` with its own `README.md` (user-facing language: English).
 - Bash scripts start with `#!/usr/bin/env bash` and `set -euo pipefail`; required binaries are checked at runtime (`need_cmd`) before privileged actions.
 - Tools must not import, source, or call each other; prefer small duplication over a shared library.
 - Tools are Linux-only by design.
