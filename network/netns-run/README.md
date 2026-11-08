@@ -17,7 +17,11 @@ routing rules, iptables rules and modified sysctls.
 
 ## How It Works
 
-1. A temporary network namespace is created (fixed name `netns-<PID>`).
+1. Before any privileged action, domains given in `--route`/`--exclude` are
+   resolved on the host with an unprivileged `nslookup` (the host's DNS; all
+   A records are taken, IPv6 ignored) — a domain without A records fails the
+   script before the sudo password prompt and before anything is created.
+   Then a temporary network namespace is created (fixed name `netns-<PID>`).
 2. A veth pair is brought up between the host and the netns
    (`10.200.X.1` ↔ `10.200.X.2/30`, X is chosen from the PID). No host
    interface is moved into the netns — the veth is its only link to the
@@ -118,8 +122,8 @@ from the netns** — the host is not affected. For addresses/subnets (including
 `default`) `ip route replace` is used, so repeated or overlapping entries do
 not fail: the last entry for a destination wins (several default routes —
 the last one given replaces the previous). For domains all IPv4 addresses
-(A records) are resolved **inside the netns** and a `/32` route is added for
-each of them.
+(A records) are resolved **on the host, before the netns is created**, and a
+`/32` route is added for each of them.
 
 **With no `--route` given at all, all traffic from the netns follows the
 host's system routing** — a catch-all exception `0.0.0.0/0` is added
@@ -141,7 +145,7 @@ the main netns rule. May be specified multiple times.
 
 - for an IP/subnet — a single rule (`to 8.8.8.8`, `to 192.168.23.0/24`);
 - for a domain — a `/32` rule for every IPv4 address of the domain (resolved
-  inside the netns).
+  on the host before the netns is created).
 
 ### `--exclude-file <file>`
 
@@ -154,9 +158,11 @@ May be specified multiple times.
 All `--route`/`--route-file`/`--exclude`/`--exclude-file` lines are validated
 **before** sudo and environment creation — an invalid line fails the script
 immediately, with a clear message. The domain name format is checked
-syntactically; the domain's addresses are resolved later, **inside the netns**
-(after the default route through the veth is up), using the host's current
-`/etc/resolv.conf`; all A records are resolved (IPv6 answers are ignored).
+syntactically; the domain's addresses are resolved **on the host, before
+sudo** (before the netns is created), using the host's current
+`/etc/resolv.conf`; all A records are resolved (IPv6 answers are ignored),
+and a domain without any A records fails the script before the sudo password
+prompt and before anything is created.
 
 ## Examples
 
@@ -226,9 +232,10 @@ it was changed.
 
 - IPv4 only (routes and exceptions are IPv4; AAAA answers are ignored when
   resolving domains).
-- The IP addresses of domains in `--route`/`--exclude` are fixed at launch
-  time — if the domain's DNS records change while the command runs, the
-  routes/rules are not updated.
+- The IP addresses of domains in `--route`/`--exclude` are fixed at script
+  start (resolved on the host before the netns is created) — if the domain's
+  DNS records change while the command runs, the routes/rules are not
+  updated.
 - Several `--route` entries with the same destination (including several
   default routes) do not add up: the last one given replaces the previous
   (`ip route replace` semantics; domain routes expand to `/32` entries and

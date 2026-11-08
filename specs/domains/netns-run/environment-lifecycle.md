@@ -6,7 +6,7 @@ The full lifecycle of the temporary network environment that `netns-run.sh` crea
 
 ## Key Files
 
-- `network/netns-run/netns-run.sh` — all lifecycle logic: identifier generation, the `cleanup`, `add_extra_routes`, `add_exclude_rules` functions, the main setup block (steps 1–10)
+- `network/netns-run/netns-run.sh` — all lifecycle logic: identifier generation, the `cleanup`, `resolve_domains`, `add_extra_routes`, `add_exclude_rules` functions, the main setup block (steps 1–10)
 
 ## Behavior
 
@@ -33,6 +33,8 @@ Before sudo, each `--route` line is parsed into the parallel arrays `ROUTE_ADDR`
 
 After this stage every via-route carries an explicit dev. With no `--route` given at all, a catch-all exception `0.0.0.0/0` is registered through the regular excludes mechanism: all netns traffic follows the host's main routing table.
 
+Then `resolve_domains` runs (still before sudo): every domain in `ROUTE_ADDR`/`EXCLUDED_ADDRS` is resolved on the host with an unprivileged `nslookup` (all unique A records, IPv6 answers ignored; `need_cmd nslookup` fires only when at least one domain is present). The resolved addresses are stored space-separated in the parallel arrays `ROUTE_IPS[i]`/`EXCLUDED_IPS[i]` ("" for default/IPv4/CIDR entries); the original entries stay in `ROUTE_ADDR`/`EXCLUDED_ADDRS` and serve as labels in log messages. A domain without A records → `die` — before the sudo password prompt and before any netns object is created.
+
 ### Environment State
 
 ```
@@ -55,8 +57,8 @@ The cleanup trap is installed on EXIT/INT/TERM from the moment the build starts;
 | 6 | reading `/proc/sys/net/ipv4/ip_forward`; if it is not 1 — `sysctl -qw ...=1` | `CHANGED_FORWARD` + `IP_FORWARD_ORIG` |
 | 7 | `iptables -t nat -A POSTROUTING -s NS_SUBNET -j MASQUERADE` (regardless of the outgoing interface); two FORWARD rules (`-i VETH_HOST -j ACCEPT`; `-o VETH_HOST -m state --state ESTABLISHED,RELATED -j ACCEPT`) | `ADDED_NAT_RULE`, `ADDED_FWD_RULE1/2` |
 | 8 | policy routing — only when `--route` entries exist: `ip rule add pref RULE_PRIO from NS_SUBNET table TABLE_ID`; the table itself is populated in step 9 (no routes are added here) | `ADDED_ROUTE`, `ADDED_RULE` |
-| 9 | `add_extra_routes` from `ROUTE_ADDR`/`ROUTE_TAIL`: for an address/subnet/`default` — `ip route replace <addr> <tail> table TABLE_ID`; for a domain — resolution inside the netns (`nslookup`, all A records, IPv6 ignored) + `ip route add <ip>/32 <tail>` | `ADDED_ROUTE` |
-| 10 | `add_exclude_rules`: for each exception `ip rule add pref EXCLUDE_RULE_PRIO from NS_SUBNET to <addr> table main`; with no `--route` a catch-all `0.0.0.0/0` is added automatically; domains — one rule per resolved A address | `ADDED_EXCLUDE_RULE` |
+| 9 | `add_extra_routes` from `ROUTE_ADDR`/`ROUTE_TAIL`/`ROUTE_IPS`: for an address/subnet/`default` — `ip route replace <addr> <tail> table TABLE_ID`; for a domain — `ip route add <ip>/32 <tail>` per A address pre-resolved on the host (before sudo) | `ADDED_ROUTE` |
+| 10 | `add_exclude_rules`: for each exception `ip rule add pref EXCLUDE_RULE_PRIO from NS_SUBNET to <addr> table main`; with no `--route` a catch-all `0.0.0.0/0` is added automatically; domains — one rule per A address pre-resolved on the host (before sudo) | `ADDED_EXCLUDE_RULE` |
 
 ### Running the Command
 
@@ -84,7 +86,7 @@ Order (each step — only if the corresponding flag is set; all deletions are be
 - Failures inside the build under `set -e` interrupt the script; the EXIT trap runs cleanup of the created objects.
 - Route resolution failures (before sudo, the environment is not created): a gateway unreachable from any host interface, no `dev` in the `ip route get` output, a nonexistent interface given via `dev` — `die`.
 - A failed `ip route replace` into `TABLE_ID` or an exception-rule add for an address — `die`; a failed `/32` route or exception-rule add for a single address of a domain — a warning (the entry may already exist), the build continues.
-- A failed domain resolution in `--route`/`--exclude` — `die` (after the netns default route is up).
+- A failed domain resolution in `--route`/`--exclude` (no IPv4 (A) records, or `nslookup` unavailable) — `die` on the host, before sudo and before anything is created.
 - Step 4' is best-effort: an unreadable host `/proc/sys/net/ipv4/ping_group_range` or a failed write of the value into the netns do not interrupt the script — `[netns-run] WARNING`, the build continues (ping and `traceroute -I` may not work for an unprivileged user inside the netns).
 - Errors during cleanup are suppressed: cleanup is idempotent and must not mask the command's exit code.
 - Code return: the script terminates with the exit code of the launched command (`APP_EC`), not with the cleanup code.
@@ -93,7 +95,7 @@ Order (each step — only if the corresponding flag is set; all deletions are be
 
 - Cleanup runs on any way of termination (EXIT/INT/TERM) and removes exactly the objects created by this run (the `CREATED_*`/`ADDED_*`/`CHANGED_*` flags).
 - The exclude rules (`EXCLUDE_RULE_PRIO`) always have a higher priority (a lower pref) than the main netns rule (`RULE_PRIO`).
-- Domain resolution is performed only after the netns default route is up (steps 9–10 after step 4).
+- Domain resolution is performed on the host, before any privileged action (before `sudo -v` and before the netns is created); build steps 9–10 only apply the already resolved addresses.
 - The netns always uses the host's DNS resolver configuration (step 5 creates no per-netns override).
 - Netns traffic that matches no route in `TABLE_ID` — including all traffic when no `--route` was given (neither the table nor the rule is created) — follows the host's main routing table.
 - After route resolution every via-route carries an explicit host interface; the resolution completes before the first privileged action.

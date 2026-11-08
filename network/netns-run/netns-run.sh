@@ -22,6 +22,10 @@
 # netns uses the host's current resolv.conf as is (no /etc/netns/...
 # bind mounts are created).
 #
+# Domains given via --route / --exclude are pre-resolved on the host
+# (an unprivileged nslookup before sudo): routes/rules are created for
+# the resolved IPv4 (A) addresses, and a domain without any is fatal.
+#
 # After the command finishes (successfully or not), everything that
 # was created is automatically torn down.
 #
@@ -90,7 +94,11 @@ RUN_AS_USER="${SUDO_USER:-$(id -un)}"
 EXTRA_ROUTES=()    # raw "<addr> via|dev ..." lines from --route / --route-file
 ROUTE_ADDR=()      # addr part of each parsed route: "default" | IPv4 | CIDR | domain
 ROUTE_TAIL=()      # normalized remainder: "via <gw> dev <if>" | "via <gw>" | "dev <if>"
+ROUTE_IPS=()       # space-separated A addresses of each route's domain,
+                   # pre-resolved on the host ("" for default/IPv4/CIDR)
 EXCLUDED_ADDRS=()  # lines "<addr|domain>" from --exclude / --exclude-file
+EXCLUDED_IPS=()    # space-separated A addresses of each exclude's domain,
+                   # pre-resolved on the host ("" for IPv4/CIDR entries)
 
 # ip rule priority for exceptions: must be LESS than RULE_PRIO (i.e. higher),
 # so that the exceptions match earlier than the rule sending all traffic
@@ -178,8 +186,8 @@ need_cmd iptables
 #   ROUTE_ADDR[i] — addr part: "default" | IPv4 | CIDR | domain;
 #   ROUTE_TAIL[i] — normalized remainder: "via <gw> dev <if>", "via <gw>"
 #                   or "dev <if>".
-# Domains are resolved later, inside the netns (after DNS is up), so a
-# name-format check is sufficient here.
+# Domains are resolved later, on the host (pre-sudo resolve_domains),
+# so a name-format check is sufficient here.
 # ---------------------------------------------------------------------------
 parse_route() {
   local r="$1"
@@ -303,7 +311,7 @@ resolve_routes
 # Format: "<addr|domain>" — an IPv4 address, a CIDR subnet or a domain.
 # No via/dev — traffic to the exceptions is directed into the host's
 # main table.
-# Domains are resolved later, inside the netns (after DNS is configured),
+# Domains are resolved later, on the host (pre-sudo resolve_domains),
 # so a name-format check is sufficient here.
 # ---------------------------------------------------------------------------
 validate_excludes() {
@@ -324,6 +332,72 @@ validate_excludes() {
 }
 validate_excludes
 log "exceptions: ${#EXCLUDED_ADDRS[@]}"
+
+# ---------------------------------------------------------------------------
+# pre-sudo resolution of domains (--route / --exclude), before `sudo -v`:
+#   every domain from ROUTE_ADDR / EXCLUDED_ADDRS is resolved on the host
+#   with an unprivileged `nslookup` (the host's resolv.conf — the netns
+#   does not exist yet); all of the domain's unique IPv4 (A) addresses
+#   are stored, space-separated, in the parallel arrays ROUTE_IPS[i] /
+#   EXCLUDED_IPS[i] ("" for default/IPv4/CIDR entries). ROUTE_ADDR /
+#   EXCLUDED_ADDRS stay untouched and serve only as labels in log
+#   messages. A domain without IPv4 (A) records is fatal: the script
+#   dies here — before the sudo password prompt and before any netns
+#   object is created.
+# ---------------------------------------------------------------------------
+resolve_domain() {
+  # resolve one domain into a space-separated list of its unique IPv4 (A)
+  # addresses (kept in the global $_resolved); dies if there are none
+  local addr="$1"
+  local -a ips=()
+  mapfile -t ips < <(nslookup "$addr" 2>/dev/null \
+    | awk '/^Address[0-9 ]*:/ {print $NF}' \
+    | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' \
+    | sort -u)
+  [[ ${#ips[@]} -gt 0 ]] || die "failed to resolve domain '$addr' (no IPv4 (A) records)"
+  _resolved="${ips[*]}"
+}
+
+resolve_domains() {
+  local -i i
+  local addr
+
+  # nslookup is required only when at least one entry is a domain
+  for addr in "${ROUTE_ADDR[@]}" "${EXCLUDED_ADDRS[@]}"; do
+    if [[ "$addr" != "default" \
+          && ! "$addr" =~ ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})(/[0-9]{1,2})?$ ]]; then
+      need_cmd nslookup
+      break
+    fi
+  done
+
+  # fill the parallel arrays: "" for default/IPv4/CIDR entries,
+  # space-separated A addresses for domains
+  for i in "${!ROUTE_ADDR[@]}"; do
+    addr="${ROUTE_ADDR[i]}"
+    if [[ "$addr" == "default" \
+          || "$addr" =~ ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})(/[0-9]{1,2})?$ ]]; then
+      ROUTE_IPS+=("")
+    else
+      log "resolving domain '$addr' on the host..."
+      resolve_domain "$addr"
+      ROUTE_IPS+=("$_resolved")
+      log "domain '$addr' resolved: ${ROUTE_IPS[i]}"
+    fi
+  done
+  for i in "${!EXCLUDED_ADDRS[@]}"; do
+    addr="${EXCLUDED_ADDRS[i]}"
+    if [[ "$addr" =~ ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})(/[0-9]{1,2})?$ ]]; then
+      EXCLUDED_IPS+=("")
+    else
+      log "resolving domain '$addr' on the host..."
+      resolve_domain "$addr"
+      EXCLUDED_IPS+=("$_resolved")
+      log "domain '$addr' resolved: ${EXCLUDED_IPS[i]}"
+    fi
+  done
+}
+resolve_domains
 
 # ---------------------------------------------------------------------------
 # unique names/subnets/identifiers for this run
@@ -459,16 +533,15 @@ fi
 log "using the host's current /etc/resolv.conf unchanged"
 
 # 6'. definition of the extra-routes function (--route / --route-file)
-#    Applied from the parsed ROUTE_ADDR/ROUTE_TAIL arrays:
+#    Applied from the parsed ROUTE_ADDR/ROUTE_TAIL/ROUTE_IPS arrays:
 #    - an IPv4 address, a CIDR subnet or "default" — `ip route replace`
 #      into the TABLE_ID table (replace, rather than add, so it does not
 #      fail on a re-run or on overlapping entries);
-#    - a domain — all of its A records are resolved inside the netns
-#      (host resolv.conf) and a /32 route is added for each address.
+#    - a domain — a /32 route is added for each of its A addresses
+#      pre-resolved on the host (resolve_domains, before sudo).
 #    The tail carries the normalized "via <gw>" / "dev <if>" / both.
-#    The call is made later (step 9): by then the netns default route
-#    through the veth (step 4) and DNS (host resolv.conf) already work,
-#    so domain resolution is guaranteed to succeed.
+#    The call is made later (step 9), after the netns default route
+#    through the veth (step 4) is up.
 add_extra_routes() {
   local -i i
   local addr tail ip
@@ -481,14 +554,8 @@ add_extra_routes() {
         || die "failed to add route '$addr $tail' to table $TABLE_ID"
       log "route added: $addr $tail (table $TABLE_ID)"
     else
-      # domain: resolve all A records inside the netns
-      log "resolving domain '$addr' inside the netns..."
-      mapfile -t _ips < <(as_root ip netns exec "$NETNS_NAME" \
-        nslookup "$addr" 2>/dev/null \
-        | awk '/^Address[0-9 ]*:/ {print $NF}' | sort -u)
-      [[ ${#_ips[@]} -gt 0 ]] || die "failed to resolve domain '$addr'"
-      for ip in "${_ips[@]}"; do
-        [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || continue
+      # domain: loop over the A addresses pre-resolved on the host
+      for ip in ${ROUTE_IPS[i]}; do
         as_root ip route add "$ip/32" $tail table "$TABLE_ID" \
           || log "WARNING: route to $ip not added (it may already exist)"
         log "route added: $ip/32 $tail (table $TABLE_ID, domain $addr)"
@@ -502,13 +569,13 @@ add_extra_routes() {
 #    must follow the host's system routing. Achieved with an ip rule
 #    with a HIGHER priority (lower number) than the main netns rule:
 #      ip rule add pref <EXCLUDE_RULE_PRIO> from <NS_SUBNET> to <addr> table main
-#    For domains we resolve all A records inside the netns and add a
-#    rule for each address (/32). The call is made later (step 10),
-#    when DNS and the default route already work inside the netns.
+#    For domains a rule is added for each of the domain's A addresses
+#    (/32), pre-resolved on the host (resolve_domains, before sudo).
 add_exclude_rules() {
-  local e addr ip
-  for e in "${EXCLUDED_ADDRS[@]}"; do
-    addr="${e%%[[:space:]]*}"
+  local -i i
+  local addr ip
+  for i in "${!EXCLUDED_ADDRS[@]}"; do
+    addr="${EXCLUDED_ADDRS[i]}"
 
     if [[ "$addr" =~ ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})(/[0-9]{1,2})?$ ]]; then
       as_root ip rule add pref "$EXCLUDE_RULE_PRIO" from "$NS_SUBNET" to "$addr" table main \
@@ -516,14 +583,8 @@ add_exclude_rules() {
       ADDED_EXCLUDE_RULE=1
       log "exception: traffic to $addr directed into the main table (rule pref $EXCLUDE_RULE_PRIO)"
     else
-      # domain: resolve all A records inside the netns
-      log "resolving domain '$addr' inside the netns (exception)..."
-      mapfile -t _ips < <(as_root ip netns exec "$NETNS_NAME" \
-        nslookup "$addr" 2>/dev/null \
-        | awk '/^Address[0-9 ]*:/ {print $NF}' | sort -u)
-      [[ ${#_ips[@]} -gt 0 ]] || die "failed to resolve domain '$addr' (exception)"
-      for ip in "${_ips[@]}"; do
-        [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || continue
+      # domain: loop over the A addresses pre-resolved on the host
+      for ip in ${EXCLUDED_IPS[i]}; do
         as_root ip rule add pref "$EXCLUDE_RULE_PRIO" from "$NS_SUBNET" to "$ip/32" table main \
           || log "WARNING: exception rule for $ip not added (it may already exist)"
         ADDED_EXCLUDE_RULE=1
@@ -566,17 +627,15 @@ fi
 
 # 9. extra routes (--route / --route-file) — added to the TABLE_ID table,
 #    so they apply only to traffic from the netns (a no-op loop when no
-#    --route entries were given).
-#    The netns default route (step 4) and DNS (host resolv.conf) are
-#    already up at this point, so domain routes are resolved inside the
-#    netns — all of the domain's addresses (all A records) are covered.
+#    --route entries were given). Domains were resolved on the host
+#    before sudo (resolve_domains) — all of the domain's addresses
+#    (all A records) are covered.
 add_extra_routes
 
 # 10. exceptions (--exclude / --exclude-file): an ip rule with a higher
 #     priority (lower pref) than the main netns rule directs traffic to
-#     the listed addresses/domains into the host's main table.
-#     The call is also made after DNS/default is up — domains are
-#     resolved inside the netns.
+#     the listed addresses/domains into the host's main table. Domains
+#     were resolved on the host before sudo (resolve_domains).
 add_exclude_rules
 
 log "environment ready. Running the command as '$RUN_AS_USER': $*"

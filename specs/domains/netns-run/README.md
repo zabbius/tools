@@ -17,8 +17,11 @@ The script is procedural bash; its "types" are global arrays and state scalars (
 EXTRA_ROUTES=()    # raw "[<addr>] via|dev ..." lines from --route / --route-file
 ROUTE_ADDR=()      # addr part of each parsed route: "default" | IPv4 | CIDR | domain
 ROUTE_TAIL=()      # normalized remainder: "via <gw> dev <if>" | "via <gw>" | "dev <if>"
+ROUTE_IPS=()       # A addresses of ROUTE_ADDR[i]'s domain, pre-resolved on the
+                   # host before sudo ("" for default/IPv4/CIDR entries)
 EXCLUDED_ADDRS=()  # "<addr|domain>" lines from --exclude / --exclude-file
                    # (+ the automatic catch-all "0.0.0.0/0" when no --route is given)
+EXCLUDED_IPS=()    # same as ROUTE_IPS, for EXCLUDED_ADDRS[i]
 
 # environment identifiers generated from the script PID
 NETNS_NAME="netns-<PID_SUFFIX>"   # PID_SUFFIX = $$ % 65536
@@ -42,10 +45,11 @@ Route line format (`--route`): `[<addr>] (via <gw> | dev <if> | via <gw> dev <if
 ## Flow
 
 ```
-arguments + validation (--route parsed into ROUTE_ADDR/ROUTE_TAIL,
+arguments + validation + resolution (--route parsed into ROUTE_ADDR/ROUTE_TAIL,
 per-route resolution: `ip -4 route get <gw>` for a via-only route,
-`ip link show` for an explicit dev; --exclude validated —
-all before sudo; an invalid line -> die)
+`ip link show` for an explicit dev; --exclude validated; domains of
+--route/--exclude resolved on the host (unprivileged `nslookup`, pre-sudo) —
+an invalid line or an unresolvable domain -> die, nothing is created)
         │
         ▼
 no --route given? -> automatic catch-all exception 0.0.0.0/0
@@ -67,7 +71,7 @@ sudo -v + keepalive process (keeps sudo rights for the whole run)
 8. policy routing (only with --route): ip rule pref RULE_PRIO
    from NS_SUBNET table TABLE_ID (the table is populated in step 9)
 9. add_extra_routes: --route entries into TABLE_ID
-   (domains resolved INSIDE the netns, a /32 per A address)
+   (a /32 per A address of a domain pre-resolved on the host)
 10. add_exclude_rules: ip rule pref EXCLUDE_RULE_PRIO from NS_SUBNET to <addr> table main
         │
         ▼
@@ -87,7 +91,7 @@ cleanup(): ip rule del (main + excludes), flush TABLE_ID, iptables -D,
 - The specified host interface is never moved into the netns; host↔netns connectivity is provided by the veth pair.
 - Inside the netns the host value of `net.ipv4.ping_group_range` is in effect (a copy, step 4'): the set of ICMP/UDP socket capabilities of an unprivileged user (`ping`, `traceroute -I`) matches the host. The host value is never modified; a copy failure is a non-fatal warning, and the value dies together with the netns.
 - Validation of all `--route`/`--route-file`/`--exclude`/`--exclude-file` is performed before sudo is called and the environment is created; an invalid line terminates the script with diagnostics and exit code 1.
-- Domains in `--route`/`--exclude` are resolved inside the netns (after the netns default route is up), using the host's DNS resolver configuration; all A records are taken, IPv6 is ignored.
+- Domains in `--route`/`--exclude` are resolved on the host, before sudo (before the netns and any privileged action), using the host's DNS resolver configuration; all A records are taken, IPv6 is ignored; a domain without A records terminates the script before anything is created.
 - For addresses/subnets in `--route`, `ip route replace` is used (robust against an overlapping default route and repeated runs), for domains — `ip route add <ip>/32`.
 - The script runs with `set -euo pipefail` and a cleanup trap on EXIT/INT/TERM; cleanup is idempotent (best-effort, deletion errors are suppressed) and uses the created-object flags.
 - Parallel runs are safe: netns/veth/table/priorities are generated from the PID; runs with matching `PID % 100` may share a table — in that case the table is shared, but routes added via `replace` do not conflict.
@@ -108,7 +112,7 @@ Required utilities (checked via `need_cmd`): `ip` (iproute2), `iptables`, `sudo`
 
 ## Extension Points
 
-- A new target type in `--route`/`--exclude` (e.g. IPv6) — extended in parallel in `parse_route`/`validate_excludes` (syntax before sudo) and `add_extra_routes`/`add_exclude_rules` (application after the netns default route is up).
+- A new target type in `--route`/`--exclude` (e.g. IPv6) — extended in parallel in `parse_route`/`validate_excludes` (syntax before sudo), `resolve_domains` (resolution on the host, before sudo) and `add_extra_routes`/`add_exclude_rules` (application during the build).
 - A new routing rule — added in the step 8–10 block into `TABLE_ID` with a corresponding `ADDED_*` flag and a mirrored deletion in `cleanup()`.
 - A detailed description of the environment lifecycle — [environment-lifecycle.md](environment-lifecycle.md).
 
