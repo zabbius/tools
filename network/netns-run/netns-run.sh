@@ -3,93 +3,71 @@
 # netns-run.sh
 #
 # Wrapper for running an arbitrary command in an isolated network
-# namespace (netns). All of the command's network traffic is forced
-# through a specified gateway reachable from one of the host's
-# interfaces. That interface itself is NOT moved into the netns:
-# the link between the netns and the host is provided by a veth pair,
-# and the required route is provided via policy routing (a separate
-# routes table + ip rule) and NAT (iptables MASQUERADE).
+# namespace (netns). The netns itself has no connectivity: its traffic
+# leaves through a veth pair onto the host, where policy routing
+# (a separate routes table + ip rule) decides where it goes:
+#
+#   - without --route: ALL traffic from the netns follows the host's
+#     system routing (the main table), as if the netns did not exist
+#     (a catch-all 0.0.0.0/0 exception is added automatically);
+#   - each --route directs traffic to the given destination through the
+#     specified gateway and/or host interface, overriding the host's
+#     system routing for that destination; destinations not covered by
+#     any --route keep following the host's system routing;
+#   - --exclude entries direct traffic to the given addresses/domains
+#     into the host's main table.
+#
+# The link between the netns and the host is provided by a veth pair;
+# outbound traffic is NAT'ed on the host (iptables MASQUERADE). The
+# netns uses the host's current resolv.conf as is (no /etc/netns/...
+# bind mounts are created).
 #
 # After the command finishes (successfully or not), everything that
 # was created is automatically torn down.
 #
 # Usage:
-#   netns-run.sh -g GATEWAY [-i IFACE] [-n NETNS] [-d DNS1,DNS2] \
-#                [-u USER] -- COMMAND [ARGS...]
+#   netns-run.sh [--route R] [--route-file F] [--exclude A] \
+#                [--exclude-file F] -- COMMAND [ARGS...]
 #
-# DNS: by default the netns uses the host's current resolv.conf as
-# is (no /etc/netns/... bind mounts are created). If different DNS
-# servers are needed — specify them via -d.
-#
-# Options:
-#   -g GATEWAY   IPv4 address of the gateway through which all of the
-#                application's traffic must go. If not set but -i is
-#                set — the current default gateway for that interface
-#                is used (ip route show default dev IFACE).
-#   -i IFACE     Host interface through which the gateway is
-#                reachable. If not set but -g is set — determined
-#                automatically via `ip route get GATEWAY`.
-#                At least one of -g / -i must be given.
-#   -n NETNS     Network namespace name. Defaults to netns-<PID>.
-#   -d DNS       Comma-separated DNS servers for the netns (e.g.
-#                1.1.1.1,9.9.9.9). If not specified — the host's
-#                current /etc/resolv.conf is used unchanged.
-#   -u USER      User on whose behalf to run the command inside the
-#                netns. Defaults to the user who ran the script
-#                ($SUDO_USER or the current one).
-#   --route R    An additional route for the given address/subnet or
-#                domain (all of the domain's addresses are used).
-#                Syntax is standard for ip route: "<addr> via <gw> [dev <if>]"
-#                ("gw" is also allowed instead of "via"). May be specified
-#                multiple times.
-#   --route-file F  A file where each non-empty line is a route in the
-#                same format as --route. Equivalent to several --route
-#                options. May be specified multiple times.
-#   --exclude A  Address/subnet or domain whose traffic from the netns
-#                is routed using the host's system routing
-#                (the main table), as if the netns did not exist.
-#                May be specified multiple times.
-#   --exclude-file F  A file with one exception per line (same format
-#                as --exclude). Equivalent to several --exclude
-#                options. May be specified multiple times.
-#   -h           Show this help.
-#
-# Examples:
-#   ./netns-run.sh -g 192.168.1.5 -- firefox
-#   ./netns-run.sh -i eth1 -- firefox
-#   ./netns-run.sh -g 10.0.0.1 -i eth1 -n vpntest -- curl -4 ifconfig.me
+# Options and examples: run `netns-run.sh --help`.
 #
 set -euo pipefail
 
 usage() {
   cat <<'EOF'
 Usage:
-  netns-run.sh [-g GATEWAY] [-i IFACE] [-n NETNS] [-d DNS1,DNS2] [-u USER] -- COMMAND [ARGS...]
+  netns-run.sh [--route R] [--route-file F] [--exclude A] \
+               [--exclude-file F] -- COMMAND [ARGS...]
 
-  -g GATEWAY   IPv4 address of the gateway (if not set — the current default gateway for -i is used)
-  -i IFACE     host interface (if not set — determined from the -g gateway)
-               at least one of -g / -i must be given
-  -n NETNS     network namespace name (defaults to netns-<PID>)
-  -d DNS       comma-separated DNS servers for the netns (by default — the host's resolv.conf as is)
-  -u USER      user on whose behalf to run the command in the netns
-  --route R    extra route: "<addr> via <gw> [dev <if>]"; addr is an IP,
-               a CIDR subnet (e.g. 10.1.0.0/16) or a domain (all of the
-               domain's addresses); "gw" may be written instead of "via".
+  --route R    route for the netns traffic to the given destination:
+                 [<addr>] (via <gw> | dev <if> | via <gw> dev <if> | dev <if> via <gw>)
+               addr is an IPv4 address, a CIDR subnet (e.g. 10.1.0.0/16),
+               a domain (all of the domain's addresses are used) or the
+               keyword "default"; an omitted addr and "0.0.0.0"/"0.0.0.0/0"
+               mean the default route. gw is the gateway's IPv4 address,
+               if is a host interface name. May be specified multiple times.
+  --route-file F  routes file (each non-empty line = one --route argument).
                May be specified multiple times.
-  --route-file F  routes file (line = same format as --route). May be specified multiple times.
-  --exclude A  address/CIDR subnet or domain whose traffic goes via the
-               host's system routing (main table), as if there were no netns.
-               May be specified multiple times.
-  --exclude-file F  exclude file (line = same format as --exclude). May be specified multiple times.
-  -h           this help
+  --exclude A  address/CIDR subnet or domain whose traffic from the netns
+               goes via the host's system routing (main table), as if
+               there were no netns. May be specified multiple times.
+  --exclude-file F  exclude file (each non-empty line = one --exclude
+               argument). May be specified multiple times.
+  --help       this help
+
+With no --route given, ALL traffic from the netns follows the host's system
+routing (a catch-all exception 0.0.0.0/0 is added). Each --route entry
+overrides the host's system routing for its destination; destinations not
+covered by any entry keep following the host's system routing.
+DNS servers are always taken from the host's current /etc/resolv.conf.
 
 Examples:
-  netns-run.sh -g 192.168.1.5 -- firefox
-  netns-run.sh -i eth1 -- firefox
-  netns-run.sh -g 192.168.1.5 --route "10.40.0.0/16 via 192.168.1.254" -- firefox
-  netns-run.sh -g 192.168.1.5 --route "10.1.0.0/16 gw 192.168.23.100" -- curl https://example.com
-  netns-run.sh -g 192.168.1.5 --exclude 192.168.23.0/24 -- curl https://example.com
-  netns-run.sh -g 192.168.1.5 --route "example.com via 192.168.1.254" -- curl https://example.com
+  netns-run.sh --route "via 192.168.1.5" -- firefox
+  netns-run.sh --route "via 192.168.1.5 dev eth1" -- firefox
+  netns-run.sh --route "10.40.0.0/16 via 192.168.1.254" -- firefox
+  netns-run.sh --route "10.1.0.0/16 dev eth1" -- curl https://example.com
+  netns-run.sh --route "example.com via 192.168.1.254" -- curl https://example.com
+  netns-run.sh --route "via 192.168.1.5" --exclude 192.168.23.0/24 -- curl https://example.com
 EOF
 }
 
@@ -107,13 +85,11 @@ as_root() {
 # ---------------------------------------------------------------------------
 # defaults / global variables
 # ---------------------------------------------------------------------------
-GATEWAY=""
-HOST_IFACE=""
-NETNS_NAME=""
-DNS_SERVERS=""     # empty = use the host's resolv.conf as is
 RUN_AS_USER="${SUDO_USER:-$(id -un)}"
 
-EXTRA_ROUTES=()    # lines "<addr> via <gw> [dev <iface>]" from --route / --route-file
+EXTRA_ROUTES=()    # raw "<addr> via|dev ..." lines from --route / --route-file
+ROUTE_ADDR=()      # addr part of each parsed route: "default" | IPv4 | CIDR | domain
+ROUTE_TAIL=()      # normalized remainder: "via <gw> dev <if>" | "via <gw>" | "dev <if>"
 EXCLUDED_ADDRS=()  # lines "<addr|domain>" from --exclude / --exclude-file
 
 # ip rule priority for exceptions: must be LESS than RULE_PRIO (i.e. higher),
@@ -129,7 +105,6 @@ RULE_PRIO=""
 HOST_VETH_IP=""
 NS_VETH_IP=""
 NS_SUBNET=""
-HOST_SUBNET=""
 
 IP_FORWARD_ORIG=""
 KEEPALIVE_PID=""
@@ -142,104 +117,186 @@ ADDED_FWD_RULE2=0
 ADDED_RULE=0
 ADDED_EXCLUDE_RULE=0
 ADDED_ROUTE=0
-ADDED_LOCAL_ROUTE=0
 CHANGED_FORWARD=0
-CREATED_RESOLV_DIR=0
 
 # ---------------------------------------------------------------------------
 # argument parsing
 # ---------------------------------------------------------------------------
+if [[ $# -eq 0 ]]; then
+  usage
+  exit 1
+fi
+
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    -g) GATEWAY="${2:-}"; shift 2 ;;
-    -i) HOST_IFACE="${2:-}"; shift 2 ;;
-    -n) NETNS_NAME="${2:-}"; shift 2 ;;
-    -d) DNS_SERVERS="${2:-}"; shift 2 ;;
-    -u) RUN_AS_USER="${2:-}"; shift 2 ;;
-    --route) EXTRA_ROUTES+=("${2:-}"); shift 2 ;;
+    --help)
+      usage
+      exit 0 ;;
+    --route)
+      [[ -n "${2:-}" ]] || die "no route given after --route (see --help)"
+      EXTRA_ROUTES+=("$2")
+      shift 2 ;;
     --route-file)
       [[ -n "${2:-}" && -r "$2" ]] || die "routes file is not readable: '${2:-}'"
       mapfile -t _rl < <(sed '/^[[:space:]]*$/d;/^[[:space:]]*#/d' "$2")
       [[ ${#_rl[@]} -gt 0 ]] || die "routes file is empty: '$2'"
       EXTRA_ROUTES+=("${_rl[@]}")
       shift 2 ;;
-    --exclude) EXCLUDED_ADDRS+=("${2:-}"); shift 2 ;;
+    --exclude)
+      [[ -n "${2:-}" ]] || die "no address given after --exclude (see --help)"
+      EXCLUDED_ADDRS+=("$2")
+      shift 2 ;;
     --exclude-file)
       [[ -n "${2:-}" && -r "$2" ]] || die "exclude file is not readable: '${2:-}'"
       mapfile -t _el < <(sed '/^[[:space:]]*$/d;/^[[:space:]]*#/d' "$2")
       [[ ${#_el[@]} -gt 0 ]] || die "exclude file is empty: '$2'"
       EXCLUDED_ADDRS+=("${_el[@]}")
       shift 2 ;;
-    -h) usage; exit 0 ;;
-    --) shift; break ;;
-    -*) die "unknown option: $1 (see -h)" ;;
+    --)
+      shift
+      break ;;
+    -*) die "unknown option: $1 (see --help)" ;;
     *)  break ;;
   esac
 done
 
-if [[ -z "$GATEWAY" && -z "$HOST_IFACE" ]]; then
-  usage
-  exit 1
-fi
 [[ $# -ge 1 ]] || die "no command specified to run (after --)"
 
 need_cmd ip
 need_cmd sudo
 need_cmd iptables
 
-if [[ -n "$GATEWAY" ]] && ! [[ "$GATEWAY" =~ ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$ ]]; then
-  die "gateway must be specified as an IPv4 address, e.g. 192.168.1.1"
+# ---------------------------------------------------------------------------
+# parsing / normalization / validation of --route / --route-file
+# (rewritten validate_routes; the "gw" synonym of "via" is NOT supported)
+# Grammar of one route:
+#   [<addr>] (via <gw> | dev <if> | via <gw> dev <if> | dev <if> via <gw>)
+# addr is an IPv4 address, a CIDR subnet (/0..32), a domain or the keyword
+# "default"; 0.0.0.0 and 0.0.0.0/0 are normalized to "default"; an omitted
+# addr means "default". gw is an IPv4 address, if is a host interface name.
+# Each parsed route is stored in two parallel arrays:
+#   ROUTE_ADDR[i] — addr part: "default" | IPv4 | CIDR | domain;
+#   ROUTE_TAIL[i] — normalized remainder: "via <gw> dev <if>", "via <gw>"
+#                   or "dev <if>".
+# Domains are resolved later, inside the netns (after DNS is up), so a
+# name-format check is sufficient here.
+# ---------------------------------------------------------------------------
+parse_route() {
+  local r="$1"
+  local -a tok=()
+  local n=0 addr="" gw="" dev="" kw=""
+  local -i have_via=0 have_dev=0 i=0 start=1
+
+  read -r -a tok <<<"$r"
+  n=${#tok[@]}
+  [[ $n -gt 0 ]] \
+    || die "route '$r': empty route string (expected: \"[<addr>] via <gw> | dev <if> | via <gw> dev <if> | dev <if> via <gw>\")"
+
+  case "${tok[0]}" in
+    via|dev)
+      addr="default"   # addr omitted — the default route
+      start=0
+      ;;
+    default|0.0.0.0|0.0.0.0/0)
+      addr="default"
+      ;;
+    *)
+      addr="${tok[0]}"
+      if [[ "$addr" =~ ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})(/([0-9]|[12][0-9]|3[0-2]))?$ ]] \
+        || [[ "$addr" =~ ^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)+\.?$ ]]; then
+        : # IPv4 address, CIDR subnet or domain
+      else
+        die "route '$r': '$addr' is not an IPv4 address, not a CIDR subnet (prefix 0-32) and not a domain"
+      fi
+      ;;
+  esac
+
+  # keyword arguments via <gw> / dev <if> — each at most once, in any order
+  for (( i = start; i < n; i++ )); do
+    kw="${tok[i]}"
+    case "$kw" in
+      via)
+        [[ $have_via -eq 0 ]] || die "route '$r': duplicate 'via'"
+        have_via=1
+        [[ $((i + 1)) -lt $n ]] || die "route '$r': no gateway given after 'via'"
+        gw="${tok[i + 1]}"
+        if [[ "$gw" == via || "$gw" == dev ]]; then
+          die "route '$r': no gateway given after 'via'"
+        fi
+        [[ "$gw" =~ ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$ ]] \
+          || die "route '$r': gateway '$gw' must be an IPv4 address"
+        i=$((i + 1))
+        ;;
+      dev)
+        [[ $have_dev -eq 0 ]] || die "route '$r': duplicate 'dev'"
+        have_dev=1
+        [[ $((i + 1)) -lt $n ]] || die "route '$r': no interface given after 'dev'"
+        dev="${tok[i + 1]}"
+        if [[ "$dev" == via || "$dev" == dev ]]; then
+          die "route '$r': no interface given after 'dev'"
+        fi
+        i=$((i + 1))
+        ;;
+      *)
+        die "route '$r': unexpected token '$kw' (expected: \"[<addr>] via <gw> | dev <if> | via <gw> dev <if> | dev <if> via <gw>\")"
+        ;;
+    esac
+  done
+
+  [[ $have_via -eq 1 || $have_dev -eq 1 ]] \
+    || die "route '$r': missing 'via <gw>' or 'dev <if>' (expected: \"[<addr>] via <gw> | dev <if> | via <gw> dev <if> | dev <if> via <gw>\")"
+
+  if [[ $have_via -eq 1 && $have_dev -eq 1 ]]; then
+    ROUTE_TAIL+=("via $gw dev $dev")
+  elif [[ $have_via -eq 1 ]]; then
+    ROUTE_TAIL+=("via $gw")
+  else
+    ROUTE_TAIL+=("dev $dev")
+  fi
+  ROUTE_ADDR+=("$addr")
+}
+
+for _r in "${EXTRA_ROUTES[@]}"; do
+  parse_route "$_r"
+done
+log "extra routes: ${#ROUTE_ADDR[@]}"
+
+# without any --route the whole netns traffic must follow the host's system
+# routing — register a catch-all exception via the regular excludes mechanism
+if [[ ${#ROUTE_ADDR[@]} -eq 0 ]]; then
+  log "no --route given: all traffic from the netns will follow the host's system routing (catch-all exception 0.0.0.0/0 added)"
+  EXCLUDED_ADDRS+=("0.0.0.0/0")
 fi
 
 # ---------------------------------------------------------------------------
-# validation of --route / --route-file
-# Format (standard ip route syntax): "<addr> via <gw> [dev <iface>]".
-# The word "gw" is allowed as a synonym of "via": "<addr> gw <gw> [dev <iface>]".
-# addr is an IPv4 address, a CIDR subnet (/0..32) or a domain; gw is the
-# gateway's IPv4 address.
-# Domains are resolved later, inside the netns (after DNS is configured),
-# so a name-format check is sufficient here.
+# pre-sudo route resolution (replaces the old gateway/interface autodetect):
+#   - a route with via but no dev — the interface is determined via
+#     `ip -4 route get <gw>`; the gateway must be reachable through one of
+#     the host's interfaces, otherwise the script dies;
+#   - a route with an explicit dev — the interface must exist on the host.
+# After this stage every via-route carries an explicit dev.
 # ---------------------------------------------------------------------------
-validate_routes() {
-  local r addr gw
-  for r in "${EXTRA_ROUTES[@]}"; do
-    # extract the first token (address/subnet/domain)
-    addr="${r%%[[:space:]]*}"
-
-    case "$r" in
-      *" via "*|*" gw "*) : ;;
-      *) die "route '$r': missing ' via <gw>' or 'gw <gw>' (format: \"<addr> via|gw <gw> [dev <iface>]\")" ;;
-    esac
-
-    gw=$(awk '{for(i=1;i<=NF;i++) if ($i=="via" || $i=="gw") {print $(i+1); exit}}' <<<"$r")
-    [[ -n "$gw" ]] || die "route '$r': no gateway given after 'via'/'gw'"
-    [[ "$gw" =~ ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$ ]] \
-      || die "route '$r': gateway '$gw' must be an IPv4 address"
-
-    if [[ "$addr" =~ ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})(/([0-9]|[12][0-9]|3[0-2]))?$ ]] \
-      || [[ "$addr" =~ ^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)+\.?$ ]]; then
-      : # IPv4 address or CIDR subnet
-    else
-      die "route '$r': '$addr' is not an IPv4 address, not a CIDR subnet (prefix 0-32) and not a domain"
-    fi
-
-    # rest of the line: only "dev <iface>" is allowed after via <gw>
-    local tail
-    tail=$(awk '{
-      for (i=1;i<=NF;i++) if ($i=="via" || $i=="gw") { for (j=i+2;j<=NF;j++) printf "%s ", $j; exit }
-    }' <<<"$r")
-    tail="${tail% }"
-    if [[ -n "$tail" && "$tail" != "dev "* ]]; then
-      die "route '$r': only 'dev <iface>' is allowed after 'via <gw>' (got: '$tail')"
-    fi
-    if [[ "$tail" == dev\ * ]]; then
-      local ifn="${tail#dev }"
-      [[ -n "$ifn" && "$ifn" != *' '* ]] || die "route '$r': no interface given after 'dev'"
+resolve_routes() {
+  local -i i
+  local gw dev
+  for i in "${!ROUTE_TAIL[@]}"; do
+    gw=$(awk '{for(j=1;j<=NF;j++) if ($j=="via") {print $(j+1); exit}}' <<<"${ROUTE_TAIL[i]}")
+    dev=$(awk '{for(j=1;j<=NF;j++) if ($j=="dev") {print $(j+1); exit}}' <<<"${ROUTE_TAIL[i]}")
+    if [[ -n "$gw" && -z "$dev" ]]; then
+      if ! dev=$(ip -4 route get "$gw" 2>/dev/null \
+           | awk '{for(j=1;j<=NF;j++) if ($j=="dev") {print $(j+1); exit}}'); then
+        die "route '${ROUTE_ADDR[i]}': gateway $gw is unreachable from any host interface (specify the interface explicitly: 'dev <if>')"
+      fi
+      [[ -n "$dev" ]] || die "route '${ROUTE_ADDR[i]}': failed to determine the interface for gateway $gw (no 'dev' in the output of 'ip route get')"
+      ROUTE_TAIL[i]="via $gw dev $dev"
+      log "route '${ROUTE_ADDR[i]}': interface for gateway $gw determined automatically: $dev"
+    elif [[ -n "$dev" ]]; then
+      ip link show "$dev" >/dev/null 2>&1 \
+        || die "route '${ROUTE_ADDR[i]}': interface '$dev' not found on the host"
     fi
   done
 }
-validate_routes
-log "extra routes: ${#EXTRA_ROUTES[@]}"
+resolve_routes
 
 # ---------------------------------------------------------------------------
 # validation of --exclude / --exclude-file
@@ -274,7 +331,7 @@ log "exceptions: ${#EXCLUDED_ADDRS[@]}"
 PID_SUFFIX=$(( $$ % 65536 ))
 OCTET=$(( ($$ % 250) + 1 ))   # 1..250 — third octet of the veth-pair subnet
 
-NETNS_NAME="${NETNS_NAME:-netns-${PID_SUFFIX}}"
+NETNS_NAME="netns-${PID_SUFFIX}"
 VETH_HOST="vh-${PID_SUFFIX}"
 VETH_NS="vn-${PID_SUFFIX}"
 TABLE_ID=$(( 100 + (PID_SUFFIX % 100) ))
@@ -288,52 +345,7 @@ HOST_VETH_IP="10.200.${OCTET}.1"
 NS_VETH_IP="10.200.${OCTET}.2"
 NS_SUBNET="10.200.${OCTET}.0/30"
 
-# ---------------------------------------------------------------------------
-# autodetect the interface from the gateway and vice versa — the gateway from the interface
-# ---------------------------------------------------------------------------
-detect_iface() {
-  local out dev
-  out=$(ip -4 route get "$GATEWAY" 2>/dev/null) \
-    || die "gateway $GATEWAY is unreachable from any host interface"
-  dev=$(awk '{for(i=1;i<=NF;i++) if ($i=="dev") {print $(i+1); exit}}' <<<"$out")
-  [[ -n "$dev" ]] || die "failed to determine the interface for gateway $GATEWAY (output: $out)"
-  echo "$dev"
-}
-
-detect_gateway() {
-  local iface="$1" gw
-  gw=$(ip -4 route show default dev "$iface" 2>/dev/null \
-        | awk '{for(i=1;i<=NF;i++) if ($i=="via") {print $(i+1); exit}}')
-  [[ -n "$gw" ]] || die "failed to determine the default gateway for interface '$iface' (no 'default via ...' route for this interface; specify the gateway explicitly via -g)"
-  echo "$gw"
-}
-
-if [[ -n "$HOST_IFACE" ]]; then
-  ip link show "$HOST_IFACE" >/dev/null 2>&1 || die "interface '$HOST_IFACE' not found on the host"
-fi
-
-if [[ -z "$HOST_IFACE" ]]; then
-  HOST_IFACE=$(detect_iface)
-  log "host interface for gateway $GATEWAY determined automatically: $HOST_IFACE"
-elif [[ -z "$GATEWAY" ]]; then
-  GATEWAY=$(detect_gateway "$HOST_IFACE")
-  log "default gateway for interface $HOST_IFACE determined automatically: $GATEWAY"
-fi
-
-# The interface's local (directly-connected) subnet — the same subnet
-# the specified gateway resides in. Needed so that the local network
-# is reachable from the netns directly rather than through GATEWAY.
-detect_host_subnet() {
-  ip -4 route show dev "$HOST_IFACE" scope link 2>/dev/null | awk '{print $1}' | head -n1
-}
-HOST_SUBNET=$(detect_host_subnet)
-if [[ -z "$HOST_SUBNET" ]]; then
-  log "WARNING: failed to determine the local (on-link) subnet of interface $HOST_IFACE — no direct route to the local network will be added, all traffic will go through $GATEWAY"
-else
-  log "local subnet of interface $HOST_IFACE: $HOST_SUBNET"
-fi
-
-log "netns=$NETNS_NAME gateway=$GATEWAY iface=$HOST_IFACE table=$TABLE_ID subnet=$NS_SUBNET user=$RUN_AS_USER"
+log "netns=$NETNS_NAME subnet=$NS_SUBNET user=$RUN_AS_USER"
 if [[ ${#EXCLUDED_ADDRS[@]} -gt 0 ]]; then
   log "exceptions: ${#EXCLUDED_ADDRS[@]} (rule pref $EXCLUDE_RULE_PRIO, table main)"
 fi
@@ -361,13 +373,13 @@ cleanup() {
     as_root ip route flush table "$TABLE_ID" 2>/dev/null
   fi
   if [[ $ADDED_FWD_RULE1 -eq 1 ]]; then
-    as_root iptables -D FORWARD -i "$VETH_HOST" -o "$HOST_IFACE" -j ACCEPT 2>/dev/null
+    as_root iptables -D FORWARD -i "$VETH_HOST" -j ACCEPT 2>/dev/null
   fi
   if [[ $ADDED_FWD_RULE2 -eq 1 ]]; then
-    as_root iptables -D FORWARD -i "$HOST_IFACE" -o "$VETH_HOST" -m state --state ESTABLISHED,RELATED -j ACCEPT 2>/dev/null
+    as_root iptables -D FORWARD -o "$VETH_HOST" -m state --state ESTABLISHED,RELATED -j ACCEPT 2>/dev/null
   fi
   if [[ $ADDED_NAT_RULE -eq 1 ]]; then
-    as_root iptables -t nat -D POSTROUTING -s "$NS_SUBNET" -o "$HOST_IFACE" -j MASQUERADE 2>/dev/null
+    as_root iptables -t nat -D POSTROUTING -s "$NS_SUBNET" -j MASQUERADE 2>/dev/null
   fi
 
   # deleting the netns automatically deletes the whole veth pair (both ends)
@@ -375,10 +387,6 @@ cleanup() {
     as_root ip netns delete "$NETNS_NAME" 2>/dev/null
   elif [[ $CREATED_VETH -eq 1 ]]; then
     as_root ip link delete "$VETH_HOST" 2>/dev/null
-  fi
-
-  if [[ $CREATED_RESOLV_DIR -eq 1 ]]; then
-    as_root rm -rf "/etc/netns/${NETNS_NAME}" 2>/dev/null
   fi
 
   if [[ $CHANGED_FORWARD -eq 1 && -n "$IP_FORWARD_ORIG" ]]; then
@@ -445,56 +453,33 @@ if [[ -n "$PING_GROUP_RANGE" ]]; then
   fi
 fi
 
-# 5. DNS: by default we do nothing — without /etc/netns/<name>/resolv.conf
-#    `ip netns exec` does not replace /etc/resolv.conf, and processes
-#    inside the netns see the host's current resolv.conf as is. If DNS
-#    is given explicitly via -d, we create a separate resolv.conf for
-#    this netns.
-if [[ -n "$DNS_SERVERS" ]]; then
-  as_root mkdir -p "/etc/netns/${NETNS_NAME}"
-  CREATED_RESOLV_DIR=1
-  {
-    IFS=',' read -ra _dns <<<"$DNS_SERVERS"
-    for _s in "${_dns[@]}"; do echo "nameserver $_s"; done
-  } | as_root tee "/etc/netns/${NETNS_NAME}/resolv.conf" >/dev/null
-  log "using the specified DNS servers: $DNS_SERVERS"
-else
-  log "using the host's current /etc/resolv.conf unchanged"
-fi
+# 5. DNS: nothing to configure — there is no /etc/netns/<name>/resolv.conf,
+#    so `ip netns exec` does not replace /etc/resolv.conf and processes
+#    inside the netns see the host's current resolv.conf as is.
+log "using the host's current /etc/resolv.conf unchanged"
 
 # 6'. definition of the extra-routes function (--route / --route-file)
-#    For addresses/subnets — simply add them to the TABLE_ID table.
-#    For domains — resolve them inside the netns (using the DNS from -d /
-#    the host's resolv.conf) and add a /32 route for each address of the
-#    domain.
-#    The word "gw" is normalized to "via" (for ip route).
-#    The call is made later (step 9), when DNS and the default route
-#    already work inside the netns — then domain resolution is
-#    guaranteed to succeed.
+#    Applied from the parsed ROUTE_ADDR/ROUTE_TAIL arrays:
+#    - an IPv4 address, a CIDR subnet or "default" — `ip route replace`
+#      into the TABLE_ID table (replace, rather than add, so it does not
+#      fail on a re-run or on overlapping entries);
+#    - a domain — all of its A records are resolved inside the netns
+#      (host resolv.conf) and a /32 route is added for each address.
+#    The tail carries the normalized "via <gw>" / "dev <if>" / both.
+#    The call is made later (step 9): by then the netns default route
+#    through the veth (step 4) and DNS (host resolv.conf) already work,
+#    so domain resolution is guaranteed to succeed.
 add_extra_routes() {
-  local r addr gw rest dev dst ip
-  for r in "${EXTRA_ROUTES[@]}"; do
-    addr="${r%%[[:space:]]*}"
-    # normalize "gw" -> "via" for ip route
-    r=$(awk '{
-      for (i=1;i<=NF;i++) if ($i=="gw") $i="via";
-      print
-    }' <<<"$r")
-    gw=$(awk '{for(i=1;i<=NF;i++) if ($i=="via") {print $(i+1); exit}}' <<<"$r")
-    rest=$(awk '{for(i=1;i<=NF;i++) if ($i=="via") { for (j=i+2;j<=NF;j++) printf "%s ", $j; exit }}' <<<"$r")
-    rest="${rest% }"
-    dev=""
-    if [[ "$rest" == dev\ * ]]; then
-      dev="${rest#dev }"
-      rest="dev ${dev}"
-    fi
-
-    if [[ "$addr" =~ ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})(/[0-9]{1,2})?$ ]]; then
-      # replace (rather than add) so the route does not fail on a re-run
-      # or on a subnet overlapping the already added default (0.0.0.0/0)
-      as_root ip route replace "$addr" via "$gw" $rest table "$TABLE_ID" \
-        || die "failed to add route '$r' to table $TABLE_ID"
-      log "route added: $addr via $gw $rest (table $TABLE_ID)"
+  local -i i
+  local addr tail ip
+  for i in "${!ROUTE_ADDR[@]}"; do
+    addr="${ROUTE_ADDR[i]}"
+    tail="${ROUTE_TAIL[i]}"
+    if [[ "$addr" == "default" \
+          || "$addr" =~ ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})(/[0-9]{1,2})?$ ]]; then
+      as_root ip route replace "$addr" $tail table "$TABLE_ID" \
+        || die "failed to add route '$addr $tail' to table $TABLE_ID"
+      log "route added: $addr $tail (table $TABLE_ID)"
     else
       # domain: resolve all A records inside the netns
       log "resolving domain '$addr' inside the netns..."
@@ -504,9 +489,9 @@ add_extra_routes() {
       [[ ${#_ips[@]} -gt 0 ]] || die "failed to resolve domain '$addr'"
       for ip in "${_ips[@]}"; do
         [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || continue
-        as_root ip route add "$ip/32" via "$gw" $rest table "$TABLE_ID" \
+        as_root ip route add "$ip/32" $tail table "$TABLE_ID" \
           || log "WARNING: route to $ip not added (it may already exist)"
-        log "route added: $ip/32 via $gw $rest (table $TABLE_ID, domain $addr)"
+        log "route added: $ip/32 $tail (table $TABLE_ID, domain $addr)"
       done
     fi
   done
@@ -555,37 +540,36 @@ if [[ "$IP_FORWARD_ORIG" != "1" ]]; then
   CHANGED_FORWARD=1
 fi
 
-# 7. outbound NAT + allowing forwarding between the veth and the external interface
-as_root iptables -t nat -A POSTROUTING -s "$NS_SUBNET" -o "$HOST_IFACE" -j MASQUERADE
+# 7. outbound NAT + allowing forwarding to/from the veth (interface-agnostic:
+#    NAT masquerades regardless of the outgoing interface; forwarding is
+#    allowed in both directions for the veth regardless of the peer interface)
+as_root iptables -t nat -A POSTROUTING -s "$NS_SUBNET" -j MASQUERADE
 ADDED_NAT_RULE=1
-as_root iptables -A FORWARD -i "$VETH_HOST" -o "$HOST_IFACE" -j ACCEPT
+as_root iptables -A FORWARD -i "$VETH_HOST" -j ACCEPT
 ADDED_FWD_RULE1=1
-as_root iptables -A FORWARD -i "$HOST_IFACE" -o "$VETH_HOST" -m state --state ESTABLISHED,RELATED -j ACCEPT
+as_root iptables -A FORWARD -o "$VETH_HOST" -m state --state ESTABLISHED,RELATED -j ACCEPT
 ADDED_FWD_RULE2=1
 
-# 8. policy routing: all traffic from the netns subnet is forced out
-#    through the specified gateway GATEWAY, regardless of the host's
-#    main routing table (i.e. regardless of the host's default gateway).
-#    The host's local subnet (the one GATEWAY itself resides in) is
-#    added as a separate on-link route — it is more specific (a longer
-#    prefix) than default, so it takes precedence in route selection,
-#    and traffic to the local-network neighbors goes directly rather
-#    than through GATEWAY.
-if [[ -n "$HOST_SUBNET" ]]; then
-  as_root ip route add "$HOST_SUBNET" dev "$HOST_IFACE" table "$TABLE_ID"
-  ADDED_LOCAL_ROUTE=1
+# 8. policy routing — only when --route entries are given: traffic from
+#    the netns subnet is looked up in the TABLE_ID table (populated in
+#    step 9 from the --route entries), which overrides the host's system
+#    routing for the covered destinations. Without --route neither the
+#    rule nor the table is created: the catch-all exception (step 10)
+#    already directs all netns traffic into the host's main table.
+#    The routes themselves — including "default", when given via
+#    `--route "via <gw>"` — are added in step 9 only.
+if [[ ${#ROUTE_ADDR[@]} -gt 0 ]]; then
+  ADDED_ROUTE=1   # step 9 populates TABLE_ID; cleanup flushes the table
+  as_root ip rule add pref "$RULE_PRIO" from "$NS_SUBNET" table "$TABLE_ID"
+  ADDED_RULE=1
 fi
-as_root ip route add default via "$GATEWAY" dev "$HOST_IFACE" table "$TABLE_ID"
-ADDED_ROUTE=1
-as_root ip rule add pref "$RULE_PRIO" from "$NS_SUBNET" table "$TABLE_ID"
-ADDED_RULE=1
 
-# 9. extra routes (--route / --route-file) — added to the same TABLE_ID
-#    table, so they apply only to traffic from the netns.
-#    The default route and DNS are brought up first (above), so that for
-#    domain routes the addresses are resolved inside the netns — this way
-#    the DNS servers given via -d are used (and all of the domain's
-#    addresses: all A records are returned).
+# 9. extra routes (--route / --route-file) — added to the TABLE_ID table,
+#    so they apply only to traffic from the netns (a no-op loop when no
+#    --route entries were given).
+#    The netns default route (step 4) and DNS (host resolv.conf) are
+#    already up at this point, so domain routes are resolved inside the
+#    netns — all of the domain's addresses (all A records) are covered.
 add_extra_routes
 
 # 10. exceptions (--exclude / --exclude-file): an ip rule with a higher

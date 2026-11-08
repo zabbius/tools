@@ -8,7 +8,7 @@ Navigation for the specification system. Format and update rules: [META.md](META
 |---|---|
 | Understand the repository as a whole (what this is, how tools are organized) | [architecture/repo-layout.md](architecture/repo-layout.md) |
 | Add a new tool to the collection | [architecture/repo-layout.md](architecture/repo-layout.md) (Adding a New Tool) |
-| Understand or change netns-run behavior (routes, excludes, DNS, teardown) | [domains/netns-run/README.md](domains/netns-run/README.md) |
+| Understand or change netns-run behavior (routes, excludes, teardown) | [domains/netns-run/README.md](domains/netns-run/README.md) |
 | Understand or change netns-run setup/cleanup order, generated IDs | [domains/netns-run/environment-lifecycle.md](domains/netns-run/environment-lifecycle.md) |
 | Touch host-system interaction (ip/iptables/sysctl/sudo calls, parsing) | [contracts/netns-run-host-system.md](contracts/netns-run-host-system.md) |
 | Change a fundamental stack/boundary decision | [decisions/001-bash-and-linux-utils-stack.md](decisions/001-bash-and-linux-utils-stack.md); record the new decision per [META.md Update Protocol](META.md#update-protocol) |

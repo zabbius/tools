@@ -13,7 +13,7 @@ A collection of small, independent system utilities ("Misc tools"), written as s
 
 | Tool | Path | Purpose |
 |---|---|---|
-| `netns-run` | `network/netns-run/` | run a command in an isolated network namespace, forcing its traffic through a specified gateway |
+| `netns-run` | `network/netns-run/` | run a command in an isolated network namespace, routing its traffic per user-supplied routes (no routes: host's system routing) |
 
 ## Conventions
 

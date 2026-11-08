@@ -10,4 +10,4 @@ Instructions for AI agents — [AGENTS.md](AGENTS.md); internal documentation (s
 
 | Tool | Description |
 |---|---|
-| [netns-run](network/netns-run/) | Run an arbitrary command in an isolated network namespace, forcing all of its traffic through a given gateway (second provider, VPN, dedicated network card) without changing the host routing. The environment is fully cleaned up after completion. See [network/netns-run/README.md](network/netns-run/README.md) for details. |
+| [netns-run](network/netns-run/) | Run an arbitrary command in an isolated network namespace, routing its traffic according to user-supplied routes (with no routes, traffic follows the host's own routing) — e.g. through a second provider, VPN or a separate network card — without changing the host routing. The environment is fully cleaned up after completion. See [network/netns-run/README.md](network/netns-run/README.md) for details. |
