@@ -18,9 +18,12 @@
 #     into the host's main table.
 #
 # The link between the netns and the host is provided by a veth pair;
-# outbound traffic is NAT'ed on the host (iptables MASQUERADE). The
-# netns uses the host's current resolv.conf as is (no /etc/netns/...
-# bind mounts are created).
+# outbound traffic is NAT'ed on the host (iptables MASQUERADE). DNS for
+# the netns: by default processes inside see the host's current
+# /etc/resolv.conf as is (no /etc/netns/... entries are created); each
+# --dns server is written into a per-netns
+# /etc/netns/<name>/resolv.conf instead (bind-mounted over /etc inside
+# the netns by `ip netns exec`) and removed at teardown.
 #
 # Domains given via --route / --exclude are pre-resolved on the host
 # (an unprivileged nslookup before sudo): routes/rules are created for
@@ -31,7 +34,7 @@
 #
 # Usage:
 #   netns-run.sh [--route R] [--route-file F] [--exclude A] \
-#                [--exclude-file F] -- COMMAND [ARGS...]
+#                [--exclude-file F] [--dns IP] -- COMMAND [ARGS...]
 #
 # Options and examples: run `netns-run.sh --help`.
 #
@@ -41,7 +44,7 @@ usage() {
   cat <<'EOF'
 Usage:
   netns-run.sh [--route R] [--route-file F] [--exclude A] \
-               [--exclude-file F] -- COMMAND [ARGS...]
+               [--exclude-file F] [--dns IP] -- COMMAND [ARGS...]
 
   --route R    route for the netns traffic to the given destination:
                  [<addr>] (via <gw> | dev <if> | via <gw> dev <if> | dev <if> via <gw>)
@@ -57,13 +60,21 @@ Usage:
                there were no netns. May be specified multiple times.
   --exclude-file F  exclude file (each non-empty line = one --exclude
                argument). May be specified multiple times.
+  --dns IP     DNS server (IPv4 address) for processes inside the netns:
+               all --dns servers are written to /etc/netns/<name>/resolv.conf,
+               which `ip netns exec` bind-mounts over /etc/resolv.conf in
+               the netns. Without --dns the netns sees the host's current
+               /etc/resolv.conf. May be specified multiple times.
   --help       this help
 
 With no --route given, ALL traffic from the netns follows the host's system
 routing (a catch-all exception 0.0.0.0/0 is added). Each --route entry
 overrides the host's system routing for its destination; destinations not
 covered by any entry keep following the host's system routing.
-DNS servers are always taken from the host's current /etc/resolv.conf.
+Without --dns, DNS servers are taken from the host's current
+/etc/resolv.conf; --dns entries override them for the netns only
+(domain resolution for --route/--exclude always uses the host's
+resolver, regardless of --dns).
 
 Examples:
   netns-run.sh --route "via 192.168.1.5" -- firefox
@@ -72,6 +83,7 @@ Examples:
   netns-run.sh --route "10.1.0.0/16 dev eth1" -- curl https://example.com
   netns-run.sh --route "example.com via 192.168.1.254" -- curl https://example.com
   netns-run.sh --route "via 192.168.1.5" --exclude 192.168.23.0/24 -- curl https://example.com
+  netns-run.sh --dns 9.9.9.9 --dns 149.112.112.112 -- curl https://example.com
 EOF
 }
 
@@ -99,6 +111,11 @@ ROUTE_IPS=()       # space-separated A addresses of each route's domain,
 EXCLUDED_ADDRS=()  # lines "<addr|domain>" from --exclude / --exclude-file
 EXCLUDED_IPS=()    # space-separated A addresses of each exclude's domain,
                    # pre-resolved on the host ("" for IPv4/CIDR entries)
+DNS_SERVERS=()     # DNS server IPv4 addresses from --dns (repeatable;
+                   # exact duplicates are dropped, the order is preserved
+                   # — it becomes the order of the "nameserver" lines);
+                   # empty = no override, the netns sees the host's
+                   # current /etc/resolv.conf as is
 
 # ip rule priority for exceptions: must be LESS than RULE_PRIO (i.e. higher),
 # so that the exceptions match earlier than the rule sending all traffic
@@ -119,6 +136,7 @@ KEEPALIVE_PID=""
 
 CREATED_NETNS=0
 CREATED_VETH=0
+CREATED_NETNS_DNS=0
 ADDED_NAT_RULE=0
 ADDED_FWD_RULE1=0
 ADDED_FWD_RULE2=0
@@ -159,6 +177,10 @@ while [[ $# -gt 0 ]]; do
       mapfile -t _el < <(sed '/^[[:space:]]*$/d;/^[[:space:]]*#/d' "$2")
       [[ ${#_el[@]} -gt 0 ]] || die "exclude file is empty: '$2'"
       EXCLUDED_ADDRS+=("${_el[@]}")
+      shift 2 ;;
+    --dns)
+      [[ -n "${2:-}" ]] || die "no DNS server given after --dns (see --help)"
+      DNS_SERVERS+=("$2")
       shift 2 ;;
     --)
       shift
@@ -333,6 +355,41 @@ validate_excludes() {
 validate_excludes
 log "exceptions: ${#EXCLUDED_ADDRS[@]}"
 
+# dedupe --dns entries preserving the given order (the first occurrence
+# wins: the order of the "nameserver" lines in resolv.conf is meaningful
+# — the first server is the primary one)
+if [[ ${#DNS_SERVERS[@]} -gt 1 ]]; then
+  mapfile -t DNS_SERVERS < <(printf '%s\n' "${DNS_SERVERS[@]}" | awk '!seen[$0]++')
+fi
+
+# ---------------------------------------------------------------------------
+# validation of --dns
+# Format: "<addr>" — an IPv4 address only. The entries are written verbatim
+# as "nameserver <addr>" lines into /etc/netns/<name>/resolv.conf (step 5);
+# exact duplicates are dropped before that, the order is preserved.
+# Domains and CIDR subnets are not accepted: a nameserver entry must be
+# usable without prior DNS resolution (a chicken-and-egg problem otherwise).
+# Servers given here do NOT participate in resolving --route/--exclude
+# domains — that resolution always happens on the host, with the host's
+# resolver configuration (resolve_domains, before sudo).
+# ---------------------------------------------------------------------------
+validate_dns_servers() {
+  local s
+  for s in "${DNS_SERVERS[@]}"; do
+    [[ "$s" =~ ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$ ]] \
+      || die "--dns '$s': not an IPv4 address (domains and CIDR subnets are not accepted)"
+  done
+}
+validate_dns_servers
+if [[ ${#DNS_SERVERS[@]} -gt 0 ]]; then
+  log "dns servers: ${DNS_SERVERS[*]}"
+  # mkdir/tee/rm are required only with --dns (the same pattern as
+  # nslookup in resolve_domains: checked only when actually needed)
+  need_cmd mkdir
+  need_cmd tee
+  need_cmd rm
+fi
+
 # ---------------------------------------------------------------------------
 # pre-sudo resolution of domains (--route / --exclude), before `sudo -v`:
 #   every domain from ROUTE_ADDR / EXCLUDED_ADDRS is resolved on the host
@@ -463,6 +520,12 @@ cleanup() {
     as_root ip link delete "$VETH_HOST" 2>/dev/null
   fi
 
+  # remove the per-netns DNS override — the only host-filesystem entry
+  # this script ever creates (best-effort, like everything above)
+  if [[ $CREATED_NETNS_DNS -eq 1 ]]; then
+    as_root rm -rf "/etc/netns/$NETNS_NAME" 2>/dev/null
+  fi
+
   if [[ $CHANGED_FORWARD -eq 1 && -n "$IP_FORWARD_ORIG" ]]; then
     as_root sysctl -qw net.ipv4.ip_forward="$IP_FORWARD_ORIG" 2>/dev/null
   fi
@@ -527,10 +590,33 @@ if [[ -n "$PING_GROUP_RANGE" ]]; then
   fi
 fi
 
-# 5. DNS: nothing to configure — there is no /etc/netns/<name>/resolv.conf,
-#    so `ip netns exec` does not replace /etc/resolv.conf and processes
-#    inside the netns see the host's current resolv.conf as is.
-log "using the host's current /etc/resolv.conf unchanged"
+# 5. DNS:
+#    - without --dns: nothing to configure — there is no
+#      /etc/netns/<name>/resolv.conf, so `ip netns exec` does not replace
+#      /etc/resolv.conf and processes inside the netns see the host's
+#      current resolv.conf as is;
+#    - with --dns: a per-netns resolv.conf is written from the validated
+#      DNS_SERVERS array. `ip netns exec` bind-mounts every file from
+#      /etc/netns/<name>/ over the same-named path in /etc inside the
+#      netns's own mount namespace — the host's /etc is not affected;
+#      this directory is the only host-filesystem entry the script ever
+#      creates, and cleanup removes it.
+if [[ ${#DNS_SERVERS[@]} -gt 0 ]]; then
+  if [[ ${#DNS_SERVERS[@]} -gt 3 ]]; then
+    log "WARNING: more than 3 DNS servers given — glibc-based resolvers use only the first 3 (MAXNS)"
+  fi
+  [[ ! -e "/etc/netns/$NETNS_NAME" ]] \
+    || die "/etc/netns/$NETNS_NAME already exists (stale leftover of a previous run with the same PID?)"
+  as_root mkdir -p "/etc/netns/$NETNS_NAME" \
+    || die "failed to create /etc/netns/$NETNS_NAME"
+  CREATED_NETNS_DNS=1
+  printf 'nameserver %s\n' "${DNS_SERVERS[@]}" \
+    | as_root tee "/etc/netns/$NETNS_NAME/resolv.conf" >/dev/null \
+    || die "failed to write /etc/netns/$NETNS_NAME/resolv.conf"
+  log "dns servers for the netns: ${DNS_SERVERS[*]} (/etc/netns/$NETNS_NAME/resolv.conf)"
+else
+  log "using the host's current /etc/resolv.conf unchanged"
+fi
 
 # 6'. definition of the extra-routes function (--route / --route-file)
 #    Applied from the parsed ROUTE_ADDR/ROUTE_TAIL/ROUTE_IPS arrays:

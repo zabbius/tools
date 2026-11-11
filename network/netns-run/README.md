@@ -33,9 +33,14 @@ routing rules, iptables rules and modified sysctls.
    the initial netns; it does not get into a new netns on its own. The write
    goes only into the netns and dies together with it; a failure is not fatal
    (a warning).
-4. DNS: nothing is configured — there is no per-netns `resolv.conf`, so
-   processes inside the netns see the host's current `/etc/resolv.conf`
-   as is.
+4. DNS: without `--dns` nothing is configured — there is no per-netns
+   `resolv.conf`, so processes inside the netns see the host's current
+   `/etc/resolv.conf` as is. With `--dns` entries a per-netns
+   `/etc/netns/<name>/resolv.conf` is written (a `nameserver` line per
+   entry); `ip netns exec` bind-mounts it over `/etc` inside the netns's
+   own mount namespace, so the host's `/etc` is not affected. Domains in
+   `--route`/`--exclude` are always resolved on the host (step 1) with the
+   host's resolver — `--dns` does not participate in that.
 5. On the host, forwarding is enabled (if it was disabled, the original value
    is restored during cleanup).
 6. NAT and FORWARD rules are added on the host without binding to any
@@ -63,13 +68,14 @@ routing rules, iptables rules and modified sysctls.
   password is asked once, afterwards it is maintained by a background
   keepalive process).
 - Utilities: `ip` (iproute2), `iptables`, `nslookup` (needed only if domains
-  are used in `--route`/`--route-file`/`--exclude`/`--exclude-file`).
+  are used in `--route`/`--route-file`/`--exclude`/`--exclude-file`),
+  `mkdir`/`tee`/`rm` (needed only with `--dns`).
 
 ## Usage
 
 ```
 netns-run.sh [--route R] [--route-file F] [--exclude A] \
-             [--exclude-file F] -- COMMAND [ARGS...]
+             [--exclude-file F] [--dns IP] -- COMMAND [ARGS...]
 ```
 
 Options may be given in any order and interleaved. Some things are **not
@@ -77,8 +83,7 @@ configurable**:
 
 - the netns is always named `netns-<PID>`;
 - the command runs as the user who launched the script (`$SUDO_USER`, or the
-  current user);
-- the netns uses the host's current `/etc/resolv.conf` as is.
+  current user).
 
 ## Options
 
@@ -88,6 +93,7 @@ configurable**:
 | `--route-file F` | Routes file; every non-empty line is one `--route` argument (lines starting with `#` are ignored). May be specified multiple times. |
 | `--exclude A` | Address/CIDR subnet or domain whose traffic from the netns goes via the host's system routing (the `main` table), as if the netns did not exist. May be specified multiple times. |
 | `--exclude-file F` | Exclude file; every non-empty line is one `--exclude` argument (lines starting with `#` are ignored). May be specified multiple times. |
+| `--dns IP` | DNS server (an IPv4 address) for processes inside the netns: all entries are written to `/etc/netns/<name>/resolv.conf`, which `ip netns exec` bind-mounts over `/etc/resolv.conf` inside the netns; the host's own `/etc` is not touched. Without `--dns` the netns sees the host's current `/etc/resolv.conf`. See "DNS servers" below. May be specified multiple times. |
 | `--help` | Help. |
 
 ## Routes and Exceptions
@@ -153,6 +159,30 @@ An exclude file with one exception per line (format same as `--exclude`; empty
 lines and `#` comments are ignored). Equivalent to several `--exclude` options.
 May be specified multiple times.
 
+### DNS servers (`--dns IP`)
+
+`--dns` sets the DNS servers (IPv4 addresses) used by processes inside the
+netns. Every entry is written as a `nameserver <addr>` line into
+`/etc/netns/<name>/resolv.conf`; `ip netns exec` bind-mounts each file from
+`/etc/netns/<name>/` over the same-named path in `/etc` inside the netns's
+own mount namespace, so the host's `/etc/resolv.conf` is never touched. The
+directory is created at startup and removed during cleanup — it is the only
+entry the script ever makes in the host filesystem.
+
+- only IPv4 addresses are accepted: a nameserver entry must be usable without
+  prior DNS resolution, so domains and CIDR subnets are rejected with an
+  error before sudo and before anything is created;
+- exact duplicate entries are dropped (the first occurrence wins); the
+  remaining entries keep the given order — it becomes the order of the
+  `nameserver` lines, so the first server is the primary one;
+- more than 3 servers trigger a warning: glibc-based resolvers use only
+  the first 3 nameserver entries (MAXNS);
+- `--dns` affects only name resolution inside the netns; resolving the
+  domains of `--route`/`--exclude` always happens on the host, with the
+  host's resolver — the `--dns` servers do not participate in that;
+- without `--dns` the netns sees the host's current `/etc/resolv.conf`
+  as is.
+
 ### Validation and Domains
 
 All `--route`/`--route-file`/`--exclude`/`--exclude-file` lines are validated
@@ -196,6 +226,11 @@ prompt and before anything is created.
 
 # routes and exceptions from files
 ./netns-run.sh --route-file routes.txt --exclude-file exclude.txt -- firefox
+
+# DNS servers for the netns (the host's /etc/resolv.conf is not touched;
+# useful together with --route, e.g. when the alternative channel has its
+# own resolvers)
+./netns-run.sh --route "via 192.168.1.5" --dns 192.168.1.5 --dns 9.9.9.9 -- firefox
 ```
 
 Example `routes.txt`:
@@ -225,17 +260,21 @@ internal.corp.example
 Cleanup runs on `EXIT`/`INT`/`TERM` and removes everything that was created:
 the `ip rule` rules (the main one and the exceptions), the policy table's
 routes (flush), the iptables rules (FORWARD, NAT), the netns (together with
-the veth pair), and restores the original value of `net.ipv4.ip_forward` if
-it was changed.
+the veth pair), the per-netns DNS override directory `/etc/netns/<name>`
+(created only when `--dns` was given), and restores the original value of
+`net.ipv4.ip_forward` if it was changed.
 
 ## Limitations
 
-- IPv4 only (routes and exceptions are IPv4; AAAA answers are ignored when
-  resolving domains).
+- IPv4 only (routes, exceptions and DNS servers are IPv4; AAAA answers are
+  ignored when resolving domains).
 - The IP addresses of domains in `--route`/`--exclude` are fixed at script
   start (resolved on the host before the netns is created) — if the domain's
   DNS records change while the command runs, the routes/rules are not
   updated.
+- `--dns` accepts only IPv4 addresses and writes only `nameserver` lines
+  (no `search`/`options` directives); the set of servers is fixed at script
+  start — a server that goes offline during the run is not replaced.
 - Several `--route` entries with the same destination (including several
   default routes) do not add up: the last one given replaces the previous
   (`ip route replace` semantics; domain routes expand to `/32` entries and
